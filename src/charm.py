@@ -30,12 +30,16 @@ from wand.apps.relations.kafka_mds import (
 )
 from wand.apps.relations.kafka_listener import (
     KafkaListenerRequiresRelation,
+    KafkaListenerRelationNotSetError
 )
 from wand.apps.relations.kafka_schema_registry import (
     KafkaSchemaRegistryRequiresRelation
 )
 from wand.apps.relations.kafka_connect import (
     KafkaConnectProvidesRelation
+)
+from wand.apps.relations.kafka_relation_base import (
+    KafkaRelationBaseTLSNotSetError
 )
 from wand.security.ssl import PKCS12CreateKeystore
 from wand.security.ssl import genRandomPassword
@@ -61,7 +65,7 @@ class KafkaConnectCharmMissingRelationError(Exception):
         super().__init__("Missing relation to: {}".format(relation_name))
 
 
-class KafkaConnectCharmCharm(KafkaJavaCharmBase):
+class KafkaConnectCharm(KafkaJavaCharmBase):
 
     CONFLUENT_PACKAGES = [
         "confluent-common",
@@ -126,12 +130,12 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
         self.ks.set_default(ssl_key="")
         self.ks.set_default(ssl_listener_cert="")
         self.ks.set_default(ssl_listener_key="")
-        self.ks.set_default(ks_listener_pwd="")
-        self.ks.set_default(ts_listener_pwd="")
+        self.ks.set_default(ks_listener_pwd=genRandomPassword())
+        self.ks.set_default(ts_listener_pwd=genRandomPassword())
         self.ks.set_default(ssl_schemaregistry_cert="")
         self.ks.set_default(ssl_schemaregistry_key="")
-        self.ks.set_default(ks_schemaregistry_pwd="")
-        self.ks.set_default(ts_schemaregistry_pwd="")
+        self.ks.set_default(ks_schemaregistry_pwd=genRandomPassword())
+        self.ks.set_default(ts_schemaregistry_pwd=genRandomPassword())
         self.ks.set_default(has_exception="")
         self.ks.set_default(listener_plaintext_pwd=genRandomPassword(24))
 
@@ -153,17 +157,27 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
             self.ks.has_exception = "Distro installation not implemented"
             raise Exception("Not Implemented Yet")
         super().install_packages('openjdk-11-headless', packages)
+        make_dirs = ["/var/log/schema-registry"]
+        self.set_folders_and_permissions(make_dirs)
+
+    def on_connect_relation_joined(self, event):
+        self.connect.on_connect_relation_joined(event)
+
+    def on_connect_relation_changed(self, event):
+        self.connect.on_connect_relation_changed(event)
 
     def on_schemaregistry_relation_joined(self, event):
         if not self._cert_relation_set(
                 event, self.sr):
             return
+        self.sr.on_schema_registry_relation_joined(event)
         self._on_config_changed(event)
 
     def on_schemaregistry_relation_changed(self, event):
         if not self._cert_relation_set(
                 event, self.sr):
             return
+        self.sr.on_schema_registry_relation_changed(event)
         self._on_config_changed(event)
 
     def _generate_listener_request(self):
@@ -236,11 +250,11 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
         return path
 
     def get_ssl_listener_keystore(self):
-        path = self.config.get("keystore-listener-path", "")
+        path = self.config.get("listener-keystore-path", "")
         return path
 
     def get_ssl_listener_truststore(self):
-        path = self.config.get("truststore-listener-path", "")
+        path = self.config.get("listener-truststore-path", "")
         return path
 
     def get_ssl_schemaregistry_keystore(self):
@@ -271,12 +285,12 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
         return self._get_ssl(self.sr, "key")
 
     def _get_ssl(self, relation, ty):
-        prefix = None
+        prefix = ""
         if isinstance(relation, KafkaListenerRequiresRelation):
             prefix = "ssl_listener"
         elif isinstance(relation, KafkaSchemaRegistryRequiresRelation):
             prefix = "ssl_sr"
-        elif isinstance(relation, KafkaConnectCharmCharm):
+        elif isinstance(relation, KafkaConnectProvidesRelation):
             prefix = "ssl"
         if len(self.config.get(prefix + "_cert")) > 0 and \
            len(self.config.get(prefix + "_key")) > 0:
@@ -287,6 +301,10 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
                 return base64.b64decode(
                     self.config[prefix + "_key"]).decode("ascii")
 
+        if not relation or not self.certificates:
+            raise KafkaRelationBaseTLSNotSetError(
+                "_get_ssl relatio {} or certificates"
+                " not available".format(relation))
         certs = self.certificates.get_server_certs()
         c = certs[relation.binding_addr][ty]
         if ty == "cert":
@@ -320,7 +338,6 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
             t[KEY] = t[GET_KEY]()
             if len(t[CERT]) > 0 and len(t[KEY]) > 0 and t[GET_KEYSTORE]():
                 logger.info("Create PKCS12 cert/key for {}".format(t[CERT]))
-                t[PWD] = genRandomPassword()
                 filename = genRandomPassword(6)
                 PKCS12CreateKeystore(
                     t[GET_KEYSTORE](),
@@ -367,7 +384,7 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
         # kafka connect and brokers and not involve Schema Registry
         dist_props["internal.key.converter.schemas.enable"] = False
         dist_props["internal.value.converter.schemas.enable"] = False
-        dist_props["group,id"] = self.config.get("group-id", "connect-cluster")
+        dist_props["group.id"] = self.config.get("group-id", "connect-cluster")
 
         # MDS Relation
         if not self.mds.relation:
@@ -386,17 +403,26 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
         if not self.sr.relation:
             raise KafkaConnectCharmMissingRelationError("schemaregistry")
         dist_props["key.converter"] = self.sr.converter
+        dist_props["value.converter"] = self.sr.converter
         dist_props["key.converter.schema.registry.url"] = self.sr.url
+        dist_props["value.converter.schema.registry.url"] = self.sr.url
         if self.get_ssl_schemaregistry_cert() and \
-           self.get_ssl_schemaregistry_key() and \
-           self.get_ssl_schemaregistry_keystore():
-            dist_props["key.converter.schema.registry.ssl.key.password"] = \
-                self.ks.ks_schemaregistry_pwd
-            dist_props["key.converter.schema.registry.ssl.keystore.password"] = \
-                self.ks.ks_schemaregistry_pwd
-            dist_props["key.converter.schema.registry.ssl.keystore.location"] = \
-                self.get_ssl_schemaregistry_keystore()
+           self.get_ssl_schemaregistry_key():
+            if self.get_ssl_schemaregistry_keystore():
+                dist_props["key.converter.schema.registry.ssl.key.password"] = \
+                    self.ks.ks_schemaregistry_pwd
+                dist_props["key.converter.schema.registry.ssl.keystore.password"] = \
+                    self.ks.ks_schemaregistry_pwd
+                dist_props["key.converter.schema.registry.ssl.keystore.location"] = \
+                    self.get_ssl_schemaregistry_keystore()
             if self.get_ssl_schemaregistry_truststore():
+                self.sr.set_TLS_auth(
+                    self.get_ssl_schemaregistry_cert(),
+                    self.get_ssl_schemaregistry_truststore(),
+                    self.ks.ts_schemaregistry_pwd,
+                    user=self.config["user"],
+                    group=self.config["group"],
+                    mode=0o640)
                 logger.info("Schema Registry: using custom truststore")
                 dist_props["key.converter.schema.registry.ssl.truststore.password"] = \
                     self.ks.ts_schemaregistry_pwd
@@ -425,6 +451,25 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
             if not self.get_ssl_schemaregistry_keystore():
                 raise KafkaConnectCharmNotValidOptionSetError("schemaregistry-keystore")
 
+        # External connection
+        dist_props["bootstrap.servers"] = self.listener.get_bootstrap_servers()
+        if self.get_ssl_cert() and self.get_ssl_key():
+            # As server side, we need the keystore at least
+            if len(self.get_ssl_keystore()) == 0:
+                raise KafkaConnectCharmNotValidOptionSetError("keystore-path")
+            dist_props["ssl.keystore.location"] = self.get_ssl_keystore()
+            dist_props["ssl.keystore.password"] = self.ks.ks_password
+            if len(self.config.get("truststore-path", "")) > 0:
+                self.connect.set_TLS_auth(
+                    self.get_ssl_cert(),
+                    self.get_ssl_truststore(),
+                    self.ks.ts_password,
+                    user=self.config["user"],
+                    group=self.config["group"],
+                    mode=0o640)
+                dist_props["ssl.truststore.location"] = self.get_ssl_truststore()
+                dist_props["ssl.truststore.password"] = self.ks.ts_password
+
         # Broker listeners setup
         if not self.listener.relation:
             raise KafkaConnectCharmMissingRelationError("listeners")
@@ -436,12 +481,14 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
         dist_props["producer.confluent.monitoring.interceptor."
                    "bootstrap.servers"] = self.listener.get_bootstrap_servers()
         if self.get_ssl_listener_cert() and self.get_ssl_listener_key():
+            # TODO: review the protocol below if SASL set
+            dist_props["consumer.security.protocol"] = "SSL"
+            dist_props["producer.security.protocol"] = "SSL"
             if self.listener.tls_client_auth_enabled():
                 if not self.get_ssl_listener_keystore():
                     # Client auth requested but keystore not set
                     raise KafkaConnectCharmNotValidOptionSetError("listener-keystore-path")
                 # TODO: review the protocol below if SASL set
-                dist_props["consumer.security.protocol"] = "SSL"
                 dist_props["consumer.confluent.monitoring.interceptor."
                            "ssl.keystore.location"] = self.get_ssl_listener_keystore()
                 dist_props["consumer.confluent.monitoring.interceptor."
@@ -456,8 +503,6 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
                 dist_props["consumer.ssl.keystore.location"] = self.get_ssl_listener_keystore()
                 dist_props["consumer.ssl.keystore.password"] = self.ks.ks_listener_pwd
                 # Producer
-                # TODO: review the protocol below if SASL set
-                dist_props["producer.security.protocol"] = "SSL"
                 dist_props["producer.confluent.monitoring.interceptor."
                            "ssl.keystore.location"] = self.get_ssl_listener_keystore()
                 dist_props["producer.confluent.monitoring.interceptor."
@@ -472,6 +517,13 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
                 dist_props["producer.ssl.keystore.location"] = self.get_ssl_listener_keystore()
                 dist_props["producer.ssl.keystore.password"] = self.ks.ks_listener_pwd
             if self.get_ssl_listener_truststore():
+                self.listener.set_TLS_auth(
+                    self.get_ssl_listener_cert(),
+                    self.get_ssl_listener_truststore(),
+                    self.ks.ts_listener_pwd,
+                    user=self.config["user"],
+                    group=self.config["group"],
+                    mode=0o640)
                 logger.info("Using custom truststore instead of java's default")
                 dist_props["consumer.confluent.monitoring.interceptor."
                            "ssl.truststore.location"] = self.get_ssl_listener_truststore()
@@ -554,16 +606,27 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
 
     def _render_connect_log4j_properties(self):
         root_logger = self.config.get("log4j-root-logger", None) or \
-            "INFO, stdout, file"
+            "INFO, stdout, connectAppender"
         self.model.unit.status = MaintenanceStatus("Rendering log4j...")
         logger.debug("Rendering log4j")
         render(source="connect_log4j.properties.j2",
-               target="/etc/kafka/connect_log4j.properties",
+               target="/etc/kafka/connect-log4j.properties",
                owner=self.config.get('user'),
                group=self.config.get("group"),
                perms=0o640,
                context={
                    "root_logger": root_logger
+               })
+
+    def _render_systemd_service(self):
+        render(source="service.conf.j2",
+               target="/lib/systemd/system/confluent-kafka-connect.service",
+               owner="root",
+               group="root",
+               perms=0o644,
+               context={
+                   "user": self.config.get("user", "cp-kafka"),
+                   "group": self.config.get("group", "confluent")
                })
 
     def _on_config_changed(self, event):
@@ -573,6 +636,9 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
             MaintenanceStatus("generate certs and keys if needed")
         logger.debug("Running _generate_keystores()")
         self._generate_keystores()
+        self.model.unit.status = \
+            MaintenanceStatus("Generate Listener settings")
+        self._generate_listener_request()
         self.model.unit.status = \
             MaintenanceStatus("Render connect-distributed.properties")
         logger.debug("Running render_connect_distributed_properties()")
@@ -589,6 +655,10 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
             self.model.unit.status = str(e)
             self.ks.has_exception = str(e)
             return
+        except KafkaListenerRelationNotSetError as e:
+            logger.warn("Listener relation not ready yet: {}".format(str(e)))
+            event.defer()
+            return
         self.model.unit.status = MaintenanceStatus("Render log4j properties")
         logger.debug("Running log4j properties renderer")
         self._render_connect_log4j_properties()
@@ -598,6 +668,7 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
         self.render_service_override_file(
             target="/etc/systemd/system/"
                    "{}.service.d/override.conf".format(self.service))
+        self._render_systemd_service()
         if self._check_if_ready_to_start():
             logger.info("Service ready or start, restarting it...")
             # Unmask and enable service
@@ -615,4 +686,4 @@ class KafkaConnectCharmCharm(KafkaJavaCharmBase):
 
 
 if __name__ == "__main__":
-    main(KafkaConnectCharmCharm)
+    main(KafkaConnectCharm)

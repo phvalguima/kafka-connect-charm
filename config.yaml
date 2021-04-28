@@ -49,6 +49,16 @@ options:
     type: string
     description: |
       Path to the truststore for the listener relation
+  keystore-sr-path:
+    default: ''
+    type: string
+    description: |
+      Path to the keystore for schema registry relation
+  truststore-sr-path:
+    default: ''
+    type: string
+    description: |
+      Path to the truststore for the schema registry relation
   regenerate-keystore-truststore:
     default: True
     type: boolean
@@ -96,11 +106,6 @@ options:
     type: string
     description: |
       Protocol type between http and https to be used between Schema Registry instances and its clients.
-  group-id:
-    default: "schema-registry"
-    type: string
-    description: |
-      Group ID for the schema registry cluster
   resource-extension-class:
     default: "io.confluent.kafka.schemaregistry.security.SchemaRegistrySecurityResourceExtension"
     type: string
@@ -157,6 +162,32 @@ options:
     type: string
     description: |
       Key to be used in base64
+  ssl_sr_cert:
+    default: ''
+    type: string
+    description: |
+      Certificate for the schema registry relation.
+      Certificate with CA certificate chain to be used in base64
+      -----BEGIN CERTIFICATE-----
+      <Primary cert in PEM format for your-domain>
+      -----END CERTIFICATE-----
+      -----BEGIN CERTIFICATE-----
+      <First intermediate CA certificate>
+      -----END CERTIFICATE-----
+      . . . . .
+      (there may be more than one intermediate cert)
+      . . . . .
+      -----BEGIN CERTIFICATE-----
+      <root-ca>
+      -----END CERTIFICATE-----
+      Pass the file with the certificate chain above as:
+      $ juju config <your-charm> ssl_cert="$(cat <crt file> | base64 -w0)"
+      Or in the bundle, using: include-base64://<path to crt file>
+  ssl_sr_key:
+    default: ''
+    type: string
+    description: |
+      Key to be used in base64
   user:
     default: 'cp-schema-registry'
     type: string
@@ -174,7 +205,7 @@ options:
       Port to be used to listen for client connections.
   log4j-root-logger:
     type: string
-    default: "INFO, stdout, file"
+    default: "INFO, stdout, connectAppender"
     description: |
       Set value for root logger on Schema Registry.
   listener:
@@ -219,6 +250,8 @@ options:
       offset.flush.interval.ms: 10000
       offset.storage.replication.factor: 3
       offset.storage.topic: connect-cluster-offsets
+      config.storage.replication.factor: 3
+      config.storage.topic: connect-cluster-configs
   jmx-exporter-port:
     type: int
     default: 8079
