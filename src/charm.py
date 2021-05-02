@@ -36,7 +36,8 @@ from wand.apps.relations.kafka_schema_registry import (
     KafkaSchemaRegistryRequiresRelation
 )
 from wand.apps.relations.kafka_connect import (
-    KafkaConnectProvidesRelation
+    KafkaConnectProvidesRelation,
+    KafkaConnectRelationNotUsedError
 )
 from wand.apps.relations.kafka_relation_base import (
     KafkaRelationBaseTLSNotSetError
@@ -457,18 +458,28 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             # As server side, we need the keystore at least
             if len(self.get_ssl_keystore()) == 0:
                 raise KafkaConnectCharmNotValidOptionSetError("keystore-path")
-            dist_props["ssl.keystore.location"] = self.get_ssl_keystore()
-            dist_props["ssl.keystore.password"] = self.ks.ks_password
-            if len(self.config.get("truststore-path", "")) > 0:
-                self.connect.set_TLS_auth(
-                    self.get_ssl_cert(),
-                    self.get_ssl_truststore(),
-                    self.ks.ts_password,
-                    user=self.config["user"],
-                    group=self.config["group"],
-                    mode=0o640)
-                dist_props["ssl.truststore.location"] = self.get_ssl_truststore()
-                dist_props["ssl.truststore.password"] = self.ks.ts_password
+            try:
+                if len(self.config.get("truststore-path", "")) > 0:
+                    self.connect.set_TLS_auth(
+                        self.get_ssl_cert(),
+                        self.get_ssl_truststore(),
+                        self.ks.ts_password,
+                        user=self.config["user"],
+                        group=self.config["group"],
+                        mode=0o640)
+                   # Seems we can have only one truststore / keystore for both
+                   # listeners and the connect API endpoint.
+                   # TODO: export the certs from connect relation and import to the other relation
+
+#                    dist_props["ssl.truststore.location"] = self.get_ssl_truststore()
+#                    dist_props["ssl.truststore.password"] = self.ks.ts_password
+                # That ensures that only if set_TLS_auth is successfully executed, then
+                # the configs below will be added
+#                dist_props["ssl.keystore.location"] = self.get_ssl_keystore()
+#                dist_props["ssl.keystore.password"] = self.ks.ks_password
+            except KafkaConnectRelationNotUsedError as e:
+                # not necessarily this endpoint will be used. Log and move along
+                logger.info(str(e))
 
         # Broker listeners setup
         if not self.listener.relation:
@@ -488,34 +499,38 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
                 if not self.get_ssl_listener_keystore():
                     # Client auth requested but keystore not set
                     raise KafkaConnectCharmNotValidOptionSetError("listener-keystore-path")
-                # TODO: review the protocol below if SASL set
-                dist_props["consumer.confluent.monitoring.interceptor."
-                           "ssl.keystore.location"] = self.get_ssl_listener_keystore()
-                dist_props["consumer.confluent.monitoring.interceptor."
-                           "ssl.keystore.password"] = self.ks.ks_listener_pwd
-                dist_props["consumer.confluent.monitoring.interceptor."
-                           "ssl.keystore.location"] = self.get_ssl_listener_keystore()
-                dist_props["consumer.confluent.monitoring.interceptor."
-                           "ssl.keystore.password"] = self.ks.ks_listener_pwd
-                dist_props["consumer.ssl.keystore.location"] = self.get_ssl_listener_keystore()
-                dist_props["consumer.confluent.monitoring.interceptor."
-                           "ssl.keystore.password"] = self.ks.ks_listener_pwd
-                dist_props["consumer.ssl.keystore.location"] = self.get_ssl_listener_keystore()
-                dist_props["consumer.ssl.keystore.password"] = self.ks.ks_listener_pwd
-                # Producer
-                dist_props["producer.confluent.monitoring.interceptor."
-                           "ssl.keystore.location"] = self.get_ssl_listener_keystore()
-                dist_props["producer.confluent.monitoring.interceptor."
-                           "ssl.keystore.password"] = self.ks.ks_listener_pwd
-                dist_props["producer.confluent.monitoring.interceptor."
-                           "ssl.keystore.location"] = self.get_ssl_listener_keystore()
-                dist_props["producer.confluent.monitoring.interceptor."
-                           "ssl.keystore.password"] = self.ks.ks_listener_pwd
-                dist_props["producer.ssl.keystore.location"] = self.get_ssl_listener_keystore()
-                dist_props["producer.confluent.monitoring.interceptor."
-                           "ssl.keystore.password"] = self.ks.ks_listener_pwd
-                dist_props["producer.ssl.keystore.location"] = self.get_ssl_listener_keystore()
-                dist_props["producer.ssl.keystore.password"] = self.ks.ks_listener_pwd
+            dist_props["listeners.https.ssl.truststore.location"] = \
+                self.get_ssl_listener_truststore()
+            dist_props["listeners.https.ssl.truststore.password"] = \
+                self.ks.ts_listener_pwd
+            # TODO: review the protocol below if SASL set
+            dist_props["consumer.confluent.monitoring.interceptor."
+                       "ssl.keystore.location"] = self.get_ssl_listener_keystore()
+            dist_props["consumer.confluent.monitoring.interceptor."
+                       "ssl.keystore.password"] = self.ks.ks_listener_pwd
+            dist_props["consumer.confluent.monitoring.interceptor."
+                       "ssl.keystore.location"] = self.get_ssl_listener_keystore()
+            dist_props["consumer.confluent.monitoring.interceptor."
+                       "ssl.keystore.password"] = self.ks.ks_listener_pwd
+            dist_props["consumer.ssl.keystore.location"] = self.get_ssl_listener_keystore()
+            dist_props["consumer.confluent.monitoring.interceptor."
+                       "ssl.keystore.password"] = self.ks.ks_listener_pwd
+            dist_props["consumer.ssl.keystore.location"] = self.get_ssl_listener_keystore()
+            dist_props["consumer.ssl.keystore.password"] = self.ks.ks_listener_pwd
+            # Producer
+            dist_props["producer.confluent.monitoring.interceptor."
+                       "ssl.keystore.location"] = self.get_ssl_listener_keystore()
+            dist_props["producer.confluent.monitoring.interceptor."
+                       "ssl.keystore.password"] = self.ks.ks_listener_pwd
+            dist_props["producer.confluent.monitoring.interceptor."
+                       "ssl.keystore.location"] = self.get_ssl_listener_keystore()
+            dist_props["producer.confluent.monitoring.interceptor."
+                       "ssl.keystore.password"] = self.ks.ks_listener_pwd
+            dist_props["producer.ssl.keystore.location"] = self.get_ssl_listener_keystore()
+            dist_props["producer.confluent.monitoring.interceptor."
+                       "ssl.keystore.password"] = self.ks.ks_listener_pwd
+            dist_props["producer.ssl.keystore.location"] = self.get_ssl_listener_keystore()
+            dist_props["producer.ssl.keystore.password"] = self.ks.ks_listener_pwd
             if self.get_ssl_listener_truststore():
                 self.listener.set_TLS_auth(
                     self.get_ssl_listener_cert(),
@@ -525,6 +540,10 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
                     group=self.config["group"],
                     mode=0o640)
                 logger.info("Using custom truststore instead of java's default")
+                dist_props["listeners.https.ssl.truststore.location"] = \
+                    self.get_ssl_listener_truststore()
+                dist_props["listeners.https.ssl.truststore.password"] = \
+                    self.ks.ts_listener_pwd
                 dist_props["consumer.confluent.monitoring.interceptor."
                            "ssl.truststore.location"] = self.get_ssl_listener_truststore()
                 dist_props["consumer.confluent.monitoring.interceptor."
@@ -566,23 +585,24 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             dist_props["listeners"] = "{}:{}".format(
                 self.config.get("listener"), self.config.get("clientPort")
             )
-            dist_props["rest.extension.classes"] = \
-                self.config.get("rest-extension-classes")
-            dist_props["rest.servlet.initializor.classes"] = \
-                self.config.get("rest-extension-classes")
+            if len(self.config.get("rest-extension-classes", "")) > 0:
+                dist_props["rest.extension.classes"] = \
+                    self.config.get("rest-extension-classes")
+                dist_props["rest.servlet.initializor.classes"] = \
+                    self.config.get("rest-extension-classes")
             if self.config.get("listener", "").startswith("https"):
                 dist_props["rest.advertised.listener"] = "https"
                 # TODO: change to SASL if needed
                 dist_props["security.protocol"] = "SSL"
                 if self.get_ssl_truststore():
                     dist_props["ssl.truststore.location"] = \
-                        self.get_ssl_truststore()
+                        self.get_ssl_listener_truststore()
                     dist_props["ssl.truststore.password"] = \
-                        self.ks.ts_password
-                    dist_props["listeners.https.ssl.truststore.location"] = \
-                        dist_props["ssl.truststore.location"]
-                    dist_props["listeners.https.ssl.truststore.password"] = \
-                        dist_props["ssl.truststore.password"]
+                        self.ks.ts_listener_pwd
+#                    dist_props["listeners.https.ssl.truststore.location"] = \
+#                        dist_props["ssl.truststore.location"]
+#                    dist_props["listeners.https.ssl.truststore.password"] = \
+#                        dist_props["ssl.truststore.password"]
             else:
                 dist_props["rest.advertised.listener"] = "http"
             # TODO: certify we need to set the key below

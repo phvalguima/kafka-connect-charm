@@ -71,11 +71,12 @@ options:
     description: |
       Group.id to be used in the Connect configuration
   rest-extension-classes:
-    default: "io.confluent.connect.security.ConnectSecurityExtension"
+    default: ""
     type: string
     description: |
       Comma-separated list of extension classes to be used by Connector REST API.
       If secrets is set, also use: io.confluent.connect.secretregistry.ConnectSecretRegistryExtension
+      If RBAC is set for confluent, set: io.confluent.connect.security.ConnectSecurityExtension
   client-auth:
     default: False
     type: boolean

@@ -4,17 +4,17 @@ variables:
   distro:   &distro   "confluent"
 machines:
   "0":
-    constraints: cores=2 mem=4G root-disk=20G
+    constraints: cores=2 mem=4G root-disk=20G tags=zookeeper
   "1":
-    constraints: cores=2 mem=4G root-disk=20G
+    constraints: cores=2 mem=4G root-disk=20G tags=zookeeper
   "2":
-    constraints: cores=2 mem=4G root-disk=20G
+    constraints: cores=2 mem=4G root-disk=20G tags=zookeeper
   "3":
-    constraints: cores=2 mem=4G root-disk=20G
+    constraints: cores=2 mem=4G root-disk=20G tags=broker
   "4":
-    constraints: cores=2 mem=4G root-disk=20G
+    constraints: cores=2 mem=4G root-disk=20G tags=broker
   "5":
-    constraints: cores=2 mem=4G root-disk=20G
+    constraints: cores=2 mem=4G root-disk=20G tags=broker
 applications:
   easyrsa:
     charm: cs:~containers/easyrsa
