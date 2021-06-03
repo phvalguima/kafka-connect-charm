@@ -165,6 +165,8 @@ class TestCharm(unittest.TestCase):
             connect.unit.status.message,
             "Waiting for schema registry relation")
 
+    @patch.object(kafka_connect.KafkaConnectProvidesRelation,
+                  "url", new_callable=PropertyMock)
     @patch.object(kafka_listener.KafkaListenerRequiresRelation,
                   "get_bootstrap_data")
     @patch.object(charm.KafkaConnectCharm,
@@ -184,7 +186,6 @@ class TestCharm(unittest.TestCase):
     @patch.object(charm, "service_reload")
     @patch.object(charm, "service_restart")
     @patch.object(charm, "service_resume")
-#    @patch.object(charm.KafkaConnectCharm, "_generate_listener_request")
     @patch.object(charm.KafkaConnectCharm, "_get_ssl")
     @patch.object(kafka_connect.KafkaConnectProvidesRelation,
                   "advertise_addr",
@@ -212,7 +213,6 @@ class TestCharm(unittest.TestCase):
                                         mock_get_public_key,
                                         mock_advertise_addr,
                                         mock_get_ssl,
-#                                        mock_generate_listener_request,
                                         mock_svc_resume,
                                         mock_svc_restart,
                                         mock_svc_reload,
@@ -225,7 +225,8 @@ class TestCharm(unittest.TestCase):
                                         mock_gen_pwd,
                                         mock_java_gen_pwd,
                                         mock_render_svc_override,
-                                        mock_bootstrap_data):
+                                        mock_bootstrap_data,
+                                        mock_connect_url_setter):
         mock_get_ssl_cert.return_value = "a"
         mock_get_ssl_key.return_value = "a"
         mock_get_ssl_sr_cert.return_value = "a"
@@ -307,3 +308,144 @@ class TestCharm(unittest.TestCase):
         self.assertSetEqual(
             set(CONFIG_CHANGED.split("\n")),
             set(simulate_render.split("\n")))
+
+    @patch.object(kafka_connect.KafkaConnectProvidesRelation,
+                  "url", new_callable=PropertyMock)
+    @patch.object(kafka_connect.KafkaConnectProvidesRelation,
+                  "set_TLS_auth")
+    @patch.object(kafka_listener.KafkaListenerRequiresRelation,
+                  "get_bootstrap_data")
+    @patch.object(charm.KafkaConnectCharm,
+                  "render_service_override_file",
+                  new_callable=PropertyMock)
+    # Mock the password generation method and replace for the same pwd
+    @patch.object(java, "genRandomPassword")
+    @patch.object(charm, "genRandomPassword")
+    @patch.object(charm.KafkaConnectCharm, "_generate_keystores")
+    @patch.object(charm.KafkaConnectCharm,
+                  "get_ssl_schemaregistry_key")
+    @patch.object(charm.KafkaConnectCharm,
+                  "get_ssl_schemaregistry_cert")
+    @patch.object(charm.KafkaConnectCharm, "get_ssl_key")
+    @patch.object(charm.KafkaConnectCharm, "get_ssl_cert")
+    @patch.object(charm, "service_running")
+    @patch.object(charm, "service_reload")
+    @patch.object(charm, "service_restart")
+    @patch.object(charm, "service_resume")
+    @patch.object(charm.KafkaConnectCharm, "_get_ssl")
+    @patch.object(kafka_connect.KafkaConnectProvidesRelation,
+                  "advertise_addr",
+                  new_callable=PropertyMock)
+    # Ignore this method since it just copies the key content to the file
+    @patch.object(kafka_mds.KafkaMDSRequiresRelation, "get_public_key",
+                  new_callable=PropertyMock)
+    # Needed for the host.name parameter
+    @patch.object(charm, "get_hostname")
+    # Needed for the host.name parameter
+    @patch.object(kafka, "get_hostname")
+    # No REST relation,which should trigger the manual creation
+    @patch.object(charm, "CreateTruststore")
+    # Ignore any set_TLS_auth calls as it is not relevant for this check
+    @patch.object(kafka_listener.KafkaListenerRequiresRelation,
+                  "set_TLS_auth",
+                  new_callable=PropertyMock)
+    @patch.object(charm, "render")
+    def test_config_changed_rel_stablished(self,
+                                           mock_render,
+                                           mock_set_tls_auth,
+                                           mock_create_ts,
+                                           mock_get_hostname_kafka,
+                                           mock_get_hostname,
+                                           mock_get_public_key,
+                                           mock_advertise_addr,
+                                           mock_get_ssl,
+                                           mock_svc_resume,
+                                           mock_svc_restart,
+                                           mock_svc_reload,
+                                           mock_svc_running,
+                                           mock_get_ssl_cert,
+                                           mock_get_ssl_key,
+                                           mock_get_ssl_sr_cert,
+                                           mock_get_ssl_sr_key,
+                                           mock_gen_jks,
+                                           mock_gen_pwd,
+                                           mock_java_gen_pwd,
+                                           mock_render_svc_override,
+                                           mock_bootstrap_data,
+                                           mock_connect_set_tls_auth,
+                                           mock_url_setter):
+        mock_get_ssl_cert.return_value = "a"
+        mock_get_ssl_key.return_value = "a"
+        mock_get_ssl_sr_cert.return_value = "a"
+        mock_get_ssl_sr_key.return_value = "a"
+        mock_gen_pwd.return_value = "confluentkeystorestorepass"
+        mock_java_gen_pwd.return_value = "confluentkeystorestorepass"
+        mock_get_hostname.return_value = "ansibleconnect1.example.com"
+        mock_get_hostname_kafka.return_value = mock_get_hostname.return_value
+        self.harness = Harness(charm.KafkaConnectCharm)
+        self.addCleanup(self.harness.cleanup)
+        self.harness.begin()
+        connect = self.harness.charm
+        #
+        # CONFIG
+        #
+        self.harness.update_config({
+            "user": "test",
+            "group": "test",
+            "keystore-path": "/var/ssl/private/kafka_connect.keystore.jks",
+            "truststore-path": "/var/ssl/private/kafka_connect.truststore.jks",
+            "keystore-sr-path": "/var/ssl/private/kafka_connect.keystore.jks",
+            "truststore-sr-path": "/var/ssl/private/kafka_connect.truststore.jks", # noqa
+            "listener-keystore-path": "", # noqa
+            "listener-truststore-path": "/var/ssl/private/kafka_connect.truststore.jks", # noqa
+            "sasl-protocol": "LDAP",
+            "mds_public_key_path": "/var/ssl/private/public.pem",
+            "mds_user": "connect_worker",
+            "mds_password": "password123",
+            "confluent_license_topic": "_confluent-command"
+        })
+        # MDS RELATION SETUP
+        mds_id = self.harness.add_relation("mds", "broker")
+        self.harness.add_relation_unit(mds_id, "broker/0")
+        self.harness.update_relation_data(mds_id, "broker", {
+            "public-key": "abc"
+        })
+        self.harness.update_relation_data(mds_id, "broker/0", {
+            "mds_url": "https://ansiblebroker1.example.com:8090"
+        })
+        # LISTENER RELATION SETUP
+        lst_id = self.harness.add_relation("listeners", "broker")
+        self.harness.add_relation_unit(lst_id, 'broker/0')
+        self.harness.update_relation_data(lst_id, 'broker/0', {
+            "bootstrap-data": '''{ "kafka_connect_charm": {
+                "bootstrap_server": "ansiblebroker1.example.com:9092"
+            }}'''
+        })
+        # Override the bootstrap_data method to return the request
+        # generated for the listener.
+        # 1st, call the actual _generate_listener_request(),
+        # to push data onto the relations
+        mock_bootstrap_data.return_value = connect._generate_listener_request()
+        print("This is the bootstrap data value", connect.listener.get_bootstrap_data())
+        # SCHEMA REGISTRY RELATION SETUP
+        sr_id = self.harness.add_relation("schemaregistry", "sr")
+        self.harness.add_relation_unit(sr_id, 'sr/0')
+        self.harness.update_relation_data(sr_id, 'sr', {
+            "url": "https://ansibleschemaregistry1.example.com:8081",
+            "converter": "io.confluent.connect.avro.AvroConverter"
+        })
+        # CONFLUENT CENTER RELATION SETUP
+        c3_id = self.harness.add_relation("c3", "c3")
+        self.harness.add_relation_unit(c3_id, 'c3/0')
+        self.harness.update_relation_data(c3_id, 'c3/0', {
+            "bootstrap-server": "ansiblebroker1.example.com:9092"
+        })
+        # CONNECT RELATION SETUP
+        connect_id = self.harness.add_relation("connect", "target")
+        self.harness.add_relation_unit(connect_id, "target/0")
+        connect._render_connect_distribute_properties()
+        # there is a connect relation, truststore creation should not
+        # be called in this case.
+        assert not mock_create_ts.called
+        mock_url_setter.assert_called_with(
+            "https://ansibleconnect1.example.com:8083")

@@ -445,23 +445,10 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
                 self.ks.ts_password
             dist_props["listeners.https.ssl.truststore.location"] = \
                 self.get_ssl_truststore()
-        """
-            if self.config.get("listener", "").startswith("https"):
-                dist_props["rest.advertised.listener"] = "https"
-                # TODO: change to SASL if needed
-                dist_props["security.protocol"] = "SSL"
-                if self.get_ssl_truststore():
-                    dist_props["ssl.truststore.location"] = \
-                        self.get_ssl_listener_truststore()
-                    dist_props["ssl.truststore.password"] = \
-                        self.ks.ts_listener_pwd
-#                    dist_props["listeners.https.ssl.truststore.location"] = \
-#                        dist_props["ssl.truststore.location"]
-#                    dist_props["listeners.https.ssl.truststore.password"] = \
-#                        dist_props["ssl.truststore.password"]
-            else:
-                dist_props["rest.advertised.listener"] = "http"
-        """
+
+        # Set the connect relation:
+        if self.connect.relations:
+            self.connect.url = self._get_api_url(self.connect.advertise_addr)
 
         # External connection
         if len(self.get_ssl_cert()) > 0 and len(self.get_ssl_key()) > 0 and \
@@ -520,7 +507,7 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             }}
 
         # 4) Schema Registry Relation
-        # Although the options below may not be directly related to the 
+        # Although the options below may not be directly related to the
         # Schema Registry, moving them here because it makes sense
         dist_props["internal.key.converter"] = \
             self.config.get(
@@ -544,7 +531,7 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
         sr_config = self.sr.generate_configs(
             self.get_ssl_schemaregistry_truststore(),
             self.ks.ts_schemaregistry_pwd,
-            len(self.get_ssl_schemaregistry_key()) > 0 and 
+            len(self.get_ssl_schemaregistry_key()) > 0 and # noqa
             len(self.get_ssl_schemaregistry_keystore()) > 0,
             self.get_ssl_schemaregistry_keystore(),
             self.ks.ks_schemaregistry_pwd)
@@ -555,52 +542,6 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             dist_props = {**dist_props, **{
                 "value.converter.{}".format(k): v for k, v in sr_config.items()
             }}
-        """
-        if self.get_ssl_schemaregistry_cert() and \
-           self.get_ssl_schemaregistry_key():
-            if self.get_ssl_schemaregistry_keystore():
-                dist_props["key.converter.schema.registry.ssl.key.password"] = \
-                    self.ks.ks_schemaregistry_pwd
-                dist_props["key.converter.schema.registry.ssl.keystore.password"] = \
-                    self.ks.ks_schemaregistry_pwd
-                dist_props["key.converter.schema.registry.ssl.keystore.location"] = \
-                    self.get_ssl_schemaregistry_keystore()
-            if self.get_ssl_schemaregistry_truststore():
-                self.sr.set_TLS_auth(
-                    self.get_ssl_schemaregistry_cert(),
-                    self.get_ssl_schemaregistry_truststore(),
-                    self.ks.ts_schemaregistry_pwd,
-                    user=self.config["user"],
-                    group=self.config["group"],
-                    mode=0o640)
-                logger.info("Schema Registry: using custom truststore")
-                dist_props["key.converter.schema.registry.ssl.truststore.password"] = \
-                    self.ks.ts_schemaregistry_pwd
-                dist_props["key.converter.schema.registry.ssl.truststore.location"] = \
-                    self.get_ssl_schemaregistry_truststore()
-            # Same logic, but setting value options now
-            dist_props["value.converter.schema.registry.ssl.key.password"] = \
-                self.ks.ks_schemaregistry_pwd
-            dist_props["value.converter.schema.registry.ssl.keystore.password"] = \
-                self.ks.ks_schemaregistry_pwd
-            dist_props["value.converter.schema.registry.ssl.keystore.location"] = \
-                self.get_ssl_schemaregistry_keystore()
-            if self.get_ssl_schemaregistry_truststore():
-                logger.info("Schema Registry: using custom truststore")
-                dist_props["value.converter.schema.registry.ssl.truststore.password"] = \
-                    self.ks.ts_schemaregistry_pwd
-                dist_props["value.converter.schema.registry.ssl.truststore.location"] = \
-                    self.get_ssl_schemaregistry_truststore()
-        elif self.sr.url.lower().startswith("https") and \
-                self.sr.get_param("client_auth"):
-            # Schema Registry URL set for HTTPS and client-auth enabled
-            if not self.get_ssl_schemaregistry_cert():
-                raise KafkaConnectCharmNotValidOptionSetError("schemaregistry-cert")
-            if not self.get_ssl_schemaregistry_key():
-                raise KafkaConnectCharmNotValidOptionSetError("schemaregistry-key")
-            if not self.get_ssl_schemaregistry_keystore():
-                raise KafkaConnectCharmNotValidOptionSetError("schemaregistry-keystore")
-        """
 
         # 5) MDS and C3 relations
         # MDS Relation
