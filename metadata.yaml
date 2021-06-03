@@ -9,6 +9,8 @@ series:
 - bionic
 subordinate: false
 requires:
+  c3:
+    interface: confluent-control-center
   mds:
     interface: mds
   listeners:

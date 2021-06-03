@@ -24,7 +24,10 @@ from charmhelpers.core.host import (
 from wand.apps.relations.tls_certificates import (
     TLSCertificateRequiresRelation
 )
-from wand.apps.kafka import KafkaJavaCharmBase
+from wand.apps.kafka import (
+    KafkaJavaCharmBase,
+    KafkaCharmBaseFeatureNotImplementedError
+)
 from wand.apps.relations.kafka_mds import (
     KafkaMDSRequiresRelation
 )
@@ -36,14 +39,18 @@ from wand.apps.relations.kafka_schema_registry import (
     KafkaSchemaRegistryRequiresRelation
 )
 from wand.apps.relations.kafka_connect import (
-    KafkaConnectProvidesRelation,
-    KafkaConnectRelationNotUsedError
+    KafkaConnectProvidesRelation
+)
+from wand.apps.relations.kafka_confluent_center import (
+    KafkaC3RequiresRelation
 )
 from wand.apps.relations.kafka_relation_base import (
     KafkaRelationBaseTLSNotSetError
 )
-from wand.security.ssl import PKCS12CreateKeystore
-from wand.security.ssl import genRandomPassword
+from wand.security.ssl import genRandomPassword, CreateTruststore
+from wand.contrib.linux import (
+    get_hostname
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +120,10 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
                                self.on_connect_relation_joined)
         self.framework.observe(self.on.connect_relation_changed,
                                self.on_connect_relation_changed)
+        self.framework.observe(self.on.c3_relation_joined,
+                               self.on_c3_relation_joined)
+        self.framework.observe(self.on.c3_relation_changed,
+                               self.on_c3_relation_changed)
         # Relation Managers
         self.listener = KafkaListenerRequiresRelation(
             self, 'listeners')
@@ -122,6 +133,7 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             TLSCertificateRequiresRelation(self, 'certificates')
         self.connect = KafkaConnectProvidesRelation(self, 'connect')
         self.mds = KafkaMDSRequiresRelation(self, "mds")
+        self.c3 = KafkaC3RequiresRelation(self, "c3")
         self.get_ssl_methods_list = [
             self.get_ssl_cert, self.get_ssl_key,
             self.get_ssl_listener_cert, self.get_ssl_listener_key,
@@ -139,6 +151,11 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
         self.ks.set_default(ts_schemaregistry_pwd=genRandomPassword())
         self.ks.set_default(has_exception="")
         self.ks.set_default(listener_plaintext_pwd=genRandomPassword(24))
+
+    def _get_url(self):
+        """ Returns the URL to be used to access Connect services"""
+        return self.config["rest_url"] if len(self.config["rest_url"]) > 0 \
+            else get_hostname(self.connect.advertise_addr)
 
     def _check_if_ready_to_start(self):
         self.model.unit.status = \
@@ -181,18 +198,56 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
         self.sr.on_schema_registry_relation_changed(event)
         self._on_config_changed(event)
 
+    def on_c3_relation_joined(self, event):
+        if not self._cert_relation_set(
+                event, self.connect):
+            return
+        self._on_config_changed(event)
+
+    def on_c3_relation_changed(self, event):
+        if not self._cert_relation_set(
+                event, self.connect):
+            return
+        self._on_config_changed(event)
+
     def _generate_listener_request(self):
         req = {}
         if self.is_sasl_enabled():
-            # TODO: implement it
-            req["SASL"] = {}
+            if self.is_sasl_ldap_enabled():
+                req["SASL"] = {
+                    "protocol": "OAUTHBEARER",
+                    "jaas.config": self._get_ldap_settings(
+                        self.mds.get_bootstrap_servers()
+                    ),
+                    "confluent": {
+                        "login.callback": "io.confluent.kafka.clients."
+                                          "plugins.auth.token.TokenUser"
+                                          "LoginCallbackHandler"
+                    }
+                }
+            elif self.is_sasl_kerberos_enabled():
+                raise KafkaCharmBaseFeatureNotImplementedError(
+                    "Missing implementation of kerberos for Connect")
         req["is_public"] = False
-        if self.is_ssl_enabled():
-            req["cert"] = self.get_ssl_cert()
+        if self.is_sasl_enabled() and self.get_ssl_listener_truststore():
+            req["secprot"] = "SASL_SSL"
+        elif not self.is_sasl_enabled() and \
+                self.get_ssl_listener_truststore():
+            req["secprot"] = "SSL"
+        elif self.is_sasl_enabled() and not \
+                self.get_ssl_listener_truststore():
+            req["secprot"] = "SASL_PLAINTEXT"
+        else:
+            req["secprot"] = "PLAINTEXT"
+        if len(self.get_ssl_listener_cert()) > 0 and \
+           len(self.get_ssl_listener_key()) > 0:
+            req["cert"] = self.get_ssl_listener_cert()
+        # Set the plaintext password
         if len(self.ks.listener_plaintext_pwd) == 0:
             self.ks.listener_plaintext_pwd = genRandomPassword(24)
         req["plaintext_pwd"] = self.ks.listener_plaintext_pwd
         self.listener.set_request(req)
+        return req
 
     def on_listeners_relation_joined(self, event):
         # If no certificate available, defer this event and wait
@@ -231,15 +286,6 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             return
         self.model.unit.status = \
             ActiveStatus("{} is running".format(self.service))
-
-    def is_sasl_enabled(self):
-        # TODO: Implement this
-        return False
-
-        def is_rbac_enabled(self):
-            if self.distro == "apache":
-                return False
-        return False
 
     # STORE GET METHODS
     def get_ssl_keystore(self):
@@ -318,43 +364,19 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
     def _generate_keystores(self):
         ks = [[self.ks.ssl_cert, self.ks.ssl_key, self.ks.ks_password,
                self.get_ssl_cert, self.get_ssl_key, self.get_ssl_keystore],
+
               [self.ks.ssl_listener_cert, self.ks.ssl_listener_key,
                self.ks.ks_listener_pwd,
                self.get_ssl_listener_cert, self.get_ssl_listener_key,
                self.get_ssl_listener_keystore],
+
               [self.ks.ssl_schemaregistry_cert, self.ks.ssl_schemaregistry_key,
                self.ks.ks_schemaregistry_pwd,
                self.get_ssl_schemaregistry_cert, self.get_ssl_schemaregistry_key,
                self.get_ssl_schemaregistry_keystore]]
-        # INDICES WITHIN THE TUPLE:
-        CERT, KEY, PWD, GET_CERT, GET_KEY, GET_KEYSTORE = 0, 1, 2, 3, 4, 5
-        # Generate the keystores if cert/key exists
-        for t in ks:
-            if t[CERT] == t[GET_CERT]() and \
-               t[KEY] == t[KEY]():
-                # Certs and keys are the same
-                logger.info("Same certs and keys for {}".format(t[CERT]))
-                continue
-            t[CERT] = t[GET_CERT]()
-            t[KEY] = t[GET_KEY]()
-            if len(t[CERT]) > 0 and len(t[KEY]) > 0 and t[GET_KEYSTORE]():
-                logger.info("Create PKCS12 cert/key for {}".format(t[CERT]))
-                filename = genRandomPassword(6)
-                PKCS12CreateKeystore(
-                    t[GET_KEYSTORE](),
-                    t[PWD],
-                    t[GET_CERT](),
-                    t[GET_KEY](),
-                    user=self.config["user"],
-                    group=self.config["group"],
-                    mode=0o640,
-                    openssl_chain_path="/tmp/" + filename + ".chain",
-                    openssl_key_path="/tmp/" + filename + ".key",
-                    openssl_p12_path="/tmp/" + filename + ".p12",
-                    ks_regenerate=self.config.get(
-                        "regenerate-keystore-truststore", False))
-            elif not t[GET_KEYSTORE]():
-                logger.debug("Keystore not found on Iteration: {}".format(t))
+
+        # Call the method from JavaCharmBase
+        super()._generate_keystores(ks)
 
     def _get_service_name(self):
         if self.distro == 'confluent':
@@ -363,7 +385,23 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             self.service = "kafka-connect.service"
         return self.service
 
-    def _render_connect_distribute_properties(self, event):
+    def is_ssl_enabled(self):
+        """Returns true if the API endpoint has the SSL enabled"""
+        return len(self.get_ssl_cert()) > 0 and \
+            len(self.get_ssl_key()) > 0
+
+    def _render_connect_distribute_properties(self):
+        """
+        Render connect-distributed.properties:
+        1) Read the options set using connect-distributed-properties
+        2) Set service options
+        2.1) Set SSL options
+        3) Set Listener-related information
+        4) Set schema-registry information
+        5) Set metadata and C3 informaiton
+        6) Render configs"""
+
+        # 1) Read the options set using connect-distributed-properties
         logger.info("Start to render connect-distributed properties")
         dist_props = \
             yaml.safe_load(self.config.get(
@@ -373,6 +411,117 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             self.config.get("confluent_license_topic")
         dist_props["connector.client.config.override.policy"] = \
             self.config.get("connector-client-config-override-policy")
+        dist_props["plugin.path"] = self.config.get("plugin-path", "")
+        dist_props["group.id"] = self.config.get("group-id", "")
+
+        # 2) Set the connect endpoint:
+        # 2.1) Recover certificates
+        # TODO(pguimaraes): recover extra certs set by actions
+        extra_certs = []
+
+        # REST Access to the Connector API
+        dist_props["rest.port"] = self.config.get("clientPort", 8083)
+        dist_props["rest.advertised.port"] = \
+            self.config.get("clientPort", 8083)
+        dist_props["listeners"] = "{}:{}".format(
+            self.config.get("listener"), self.config.get("clientPort")
+        )
+        dist_props["rest.advertised.host.name"] = "{}".format(
+            self.config["api_url"] if len(self.config["api_url"]) > 0
+            else get_hostname(self.connect.advertise_addr))
+        if self.is_ssl_enabled():
+            dist_props["rest.advertised.listener"] = "https"
+        else:
+            dist_props["rest.advertised.listener"] = "http"
+        if len(self.get_ssl_keystore()) > 0:
+            dist_props["listeners.https.ssl.key.password"] = \
+                self.ks.ks_password
+            dist_props["listeners.https.ssl.keystore.password"] = \
+                self.ks.ks_password
+            dist_props["listeners.https.ssl.keystore.location"] = \
+                self.get_ssl_keystore()
+        if len(self.get_ssl_truststore()) > 0:
+            dist_props["listeners.https.ssl.truststore.password"] = \
+                self.ks.ts_password
+            dist_props["listeners.https.ssl.truststore.location"] = \
+                self.get_ssl_truststore()
+        """
+            if self.config.get("listener", "").startswith("https"):
+                dist_props["rest.advertised.listener"] = "https"
+                # TODO: change to SASL if needed
+                dist_props["security.protocol"] = "SSL"
+                if self.get_ssl_truststore():
+                    dist_props["ssl.truststore.location"] = \
+                        self.get_ssl_listener_truststore()
+                    dist_props["ssl.truststore.password"] = \
+                        self.ks.ts_listener_pwd
+#                    dist_props["listeners.https.ssl.truststore.location"] = \
+#                        dist_props["ssl.truststore.location"]
+#                    dist_props["listeners.https.ssl.truststore.password"] = \
+#                        dist_props["ssl.truststore.password"]
+            else:
+                dist_props["rest.advertised.listener"] = "http"
+        """
+
+        # External connection
+        if len(self.get_ssl_cert()) > 0 and len(self.get_ssl_key()) > 0 and \
+           len(self.get_ssl_truststore()):
+            # As server side, we need the keystore at least
+            if len(self.get_ssl_keystore()) == 0:
+                raise KafkaConnectCharmNotValidOptionSetError("keystore-path")
+            if self.connect.relations:
+                self.connect.set_TLS_auth(
+                    self.get_ssl_cert(),
+                    self.get_ssl_truststore(),
+                    self.ks.ts_password,
+                    user=self.config["user"],
+                    group=self.config["group"],
+                    mode=0o640)
+            else:
+                # We should consider the situation where connect
+                # is only exposed
+                # to the outside and no relations are set
+                ts_regenerate = \
+                    self.config["regenerate-keystore-truststore"]
+                CreateTruststore(
+                    self.get_ssl_truststore(),
+                    self.ks.ts_password,
+                    extra_certs,
+                    ts_regenerate=ts_regenerate,
+                    user=self.config["user"],
+                    group=self.config["group"],
+                    mode=0o640)
+
+        # 3) Broker listeners setup
+        if not self.listener.relation:
+            raise KafkaConnectCharmMissingRelationError("listeners")
+        if self.get_ssl_listener_truststore():
+            self.listener.set_TLS_auth(
+                self.get_ssl_listener_cert(),
+                self.get_ssl_listener_truststore(),
+                self.ks.ts_listener_pwd,
+                user=self.config["user"],
+                group=self.config["group"],
+                mode=0o640)
+        listener_opts = self.listener.generate_options(
+            self.get_ssl_listener_keystore(),
+            self.ks.ks_password,
+            self.get_ssl_listener_truststore(),
+            self.ks.ts_password,
+            prefix="")
+        if listener_opts:
+            dist_props = {**dist_props, **listener_opts}
+            # Also add listener endpoints for producer and consumer
+            dist_props = {**dist_props, **{
+                "consumer.{}".format(k): v for k, v in listener_opts.items()
+            }}
+            dist_props = {**dist_props, **{
+                "producer.{}".format(k): v for k, v in listener_opts.items()
+            }}
+
+        # 4) Schema Registry Relation
+        # Although the options below may not be directly related to the 
+        # Schema Registry, moving them here because it makes sense
         dist_props["internal.key.converter"] = \
             self.config.get(
                 "internal-converter",
@@ -381,32 +530,32 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             self.config.get(
                 "internal-converter",
                 "org.apache.kafka.connect.json.JsonConverter")
-        # This is always set to false as the conversion will happen between
-        # kafka connect and brokers and not involve Schema Registry
-        dist_props["internal.key.converter.schemas.enable"] = False
-        dist_props["internal.value.converter.schemas.enable"] = False
-        dist_props["group.id"] = self.config.get("group-id", "connect-cluster")
-
-        # MDS Relation
-        if not self.mds.relation:
-            # MDS is only available for Confluent
-            logger.warning("MDS relation not detected")
-        elif self.mds.relation and self.distro != "confluent":
-            raise KafkaConnectCharmUnsupportedParamError(
-                "kafka distro {} does not support MDS relation".format(self.distro)
-            )
-        else:
-            # MDS relation present
-            mds_opts = self.mds.get_options()
-            dist_props = {**dist_props, **mds_opts}
-
-        # Schema Registry Relation
+        # Set it to False if the internal-convert option is configured
+        dist_props["internal.key.converter.schemas.enable"] = \
+            str(len(dist_props["internal.key.converter"]) == 0).lower()
+        dist_props["internal.value.converter.schemas.enable"] = \
+            str(len(dist_props["internal.value.converter"]) == 0).lower()
         if not self.sr.relation:
             raise KafkaConnectCharmMissingRelationError("schemaregistry")
         dist_props["key.converter"] = self.sr.converter
         dist_props["value.converter"] = self.sr.converter
         dist_props["key.converter.schema.registry.url"] = self.sr.url
         dist_props["value.converter.schema.registry.url"] = self.sr.url
+        sr_config = self.sr.generate_configs(
+            self.get_ssl_schemaregistry_truststore(),
+            self.ks.ts_schemaregistry_pwd,
+            len(self.get_ssl_schemaregistry_key()) > 0 and 
+            len(self.get_ssl_schemaregistry_keystore()) > 0,
+            self.get_ssl_schemaregistry_keystore(),
+            self.ks.ks_schemaregistry_pwd)
+        if sr_config:
+            dist_props = {**dist_props, **{
+                "key.converter.{}".format(k): v for k, v in sr_config.items()
+            }}
+            dist_props = {**dist_props, **{
+                "value.converter.{}".format(k): v for k, v in sr_config.items()
+            }}
+        """
         if self.get_ssl_schemaregistry_cert() and \
            self.get_ssl_schemaregistry_key():
             if self.get_ssl_schemaregistry_keystore():
@@ -451,169 +600,64 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
                 raise KafkaConnectCharmNotValidOptionSetError("schemaregistry-key")
             if not self.get_ssl_schemaregistry_keystore():
                 raise KafkaConnectCharmNotValidOptionSetError("schemaregistry-keystore")
+        """
 
-        # External connection
-        dist_props["bootstrap.servers"] = self.listener.get_bootstrap_servers()
-        if self.get_ssl_cert() and self.get_ssl_key():
-            # As server side, we need the keystore at least
-            if len(self.get_ssl_keystore()) == 0:
-                raise KafkaConnectCharmNotValidOptionSetError("keystore-path")
-            try:
-                if len(self.config.get("truststore-path", "")) > 0:
-                    self.connect.set_TLS_auth(
-                        self.get_ssl_cert(),
-                        self.get_ssl_truststore(),
-                        self.ks.ts_password,
-                        user=self.config["user"],
-                        group=self.config["group"],
-                        mode=0o640)
-                   # Seems we can have only one truststore / keystore for both
-                   # listeners and the connect API endpoint.
-                   # TODO: export the certs from connect relation and import to the other relation
-
-#                    dist_props["ssl.truststore.location"] = self.get_ssl_truststore()
-#                    dist_props["ssl.truststore.password"] = self.ks.ts_password
-                # That ensures that only if set_TLS_auth is successfully executed, then
-                # the configs below will be added
-#                dist_props["ssl.keystore.location"] = self.get_ssl_keystore()
-#                dist_props["ssl.keystore.password"] = self.ks.ks_password
-            except KafkaConnectRelationNotUsedError as e:
-                # not necessarily this endpoint will be used. Log and move along
-                logger.info(str(e))
-
-        # Broker listeners setup
-        if not self.listener.relation:
-            raise KafkaConnectCharmMissingRelationError("listeners")
-        dist_props["consumer.bootstrap.servers"] = self.listener.get_bootstrap_servers()
-        dist_props["consumer.confluent.monitoring.interceptor."
-                   "bootstrap.servers"] = self.listener.get_bootstrap_servers()
-        # Producer
-        dist_props["producer.bootstrap.servers"] = self.listener.get_bootstrap_servers()
-        dist_props["producer.confluent.monitoring.interceptor."
-                   "bootstrap.servers"] = self.listener.get_bootstrap_servers()
-        if self.get_ssl_listener_cert() and self.get_ssl_listener_key():
-            # TODO: review the protocol below if SASL set
-            dist_props["consumer.security.protocol"] = "SSL"
-            dist_props["producer.security.protocol"] = "SSL"
-            if self.listener.tls_client_auth_enabled():
-                if not self.get_ssl_listener_keystore():
-                    # Client auth requested but keystore not set
-                    raise KafkaConnectCharmNotValidOptionSetError("listener-keystore-path")
-            dist_props["listeners.https.ssl.truststore.location"] = \
-                self.get_ssl_listener_truststore()
-            dist_props["listeners.https.ssl.truststore.password"] = \
-                self.ks.ts_listener_pwd
-            # TODO: review the protocol below if SASL set
-            dist_props["consumer.confluent.monitoring.interceptor."
-                       "ssl.keystore.location"] = self.get_ssl_listener_keystore()
-            dist_props["consumer.confluent.monitoring.interceptor."
-                       "ssl.keystore.password"] = self.ks.ks_listener_pwd
-            dist_props["consumer.confluent.monitoring.interceptor."
-                       "ssl.keystore.location"] = self.get_ssl_listener_keystore()
-            dist_props["consumer.confluent.monitoring.interceptor."
-                       "ssl.keystore.password"] = self.ks.ks_listener_pwd
-            dist_props["consumer.ssl.keystore.location"] = self.get_ssl_listener_keystore()
-            dist_props["consumer.confluent.monitoring.interceptor."
-                       "ssl.keystore.password"] = self.ks.ks_listener_pwd
-            dist_props["consumer.ssl.keystore.location"] = self.get_ssl_listener_keystore()
-            dist_props["consumer.ssl.keystore.password"] = self.ks.ks_listener_pwd
-            # Producer
-            dist_props["producer.confluent.monitoring.interceptor."
-                       "ssl.keystore.location"] = self.get_ssl_listener_keystore()
-            dist_props["producer.confluent.monitoring.interceptor."
-                       "ssl.keystore.password"] = self.ks.ks_listener_pwd
-            dist_props["producer.confluent.monitoring.interceptor."
-                       "ssl.keystore.location"] = self.get_ssl_listener_keystore()
-            dist_props["producer.confluent.monitoring.interceptor."
-                       "ssl.keystore.password"] = self.ks.ks_listener_pwd
-            dist_props["producer.ssl.keystore.location"] = self.get_ssl_listener_keystore()
-            dist_props["producer.confluent.monitoring.interceptor."
-                       "ssl.keystore.password"] = self.ks.ks_listener_pwd
-            dist_props["producer.ssl.keystore.location"] = self.get_ssl_listener_keystore()
-            dist_props["producer.ssl.keystore.password"] = self.ks.ks_listener_pwd
-            if self.get_ssl_listener_truststore():
-                self.listener.set_TLS_auth(
-                    self.get_ssl_listener_cert(),
-                    self.get_ssl_listener_truststore(),
-                    self.ks.ts_listener_pwd,
-                    user=self.config["user"],
-                    group=self.config["group"],
-                    mode=0o640)
-                logger.info("Using custom truststore instead of java's default")
-                dist_props["listeners.https.ssl.truststore.location"] = \
-                    self.get_ssl_listener_truststore()
-                dist_props["listeners.https.ssl.truststore.password"] = \
-                    self.ks.ts_listener_pwd
-                dist_props["consumer.confluent.monitoring.interceptor."
-                           "ssl.truststore.location"] = self.get_ssl_listener_truststore()
-                dist_props["consumer.confluent.monitoring.interceptor."
-                           "ssl.truststore.password"] = self.ks.ts_listener_pwd
-                dist_props["consumer.confluent.monitoring.interceptor."
-                           "ssl.truststore.location"] = self.get_ssl_listener_truststore()
-                dist_props["consumer.confluent.monitoring.interceptor."
-                           "ssl.truststore.password"] = self.ks.ts_listener_pwd
-                dist_props["consumer.ssl.truststore.location"] = self.get_ssl_listener_truststore()
-                dist_props["consumer.confluent.monitoring.interceptor."
-                           "ssl.truststore.password"] = self.ks.ts_listener_pwd
-                dist_props["consumer.ssl.truststore.location"] = self.get_ssl_listener_truststore()
-                dist_props["consumer.ssl.truststore.password"] = self.ks.ts_listener_pwd
-                # Producer
-                dist_props["producer.confluent.monitoring.interceptor."
-                           "ssl.truststore.location"] = self.get_ssl_listener_truststore()
-                dist_props["producer.confluent.monitoring.interceptor."
-                           "ssl.truststore.password"] = self.ks.ts_listener_pwd
-                dist_props["producer.confluent.monitoring.interceptor."
-                           "ssl.truststore.location"] = self.get_ssl_listener_truststore()
-                dist_props["producer.confluent.monitoring.interceptor."
-                           "ssl.truststore.password"] = self.ks.ts_listener_pwd
-                dist_props["producer.ssl.truststore.location"] = self.get_ssl_listener_truststore()
-                dist_props["producer.confluent.monitoring.interceptor."
-                           "ssl.truststore.password"] = self.ks.ts_listener_pwd
-                dist_props["producer.ssl.truststore.location"] = self.get_ssl_listener_truststore()
-                dist_props["producer.ssl.truststore.password"] = self.ks.ts_listener_pwd
-
-# TODO: Define those values later and switch the security protocol above
-# producer.confluent.monitoring.interceptor.sasl.jaas.config=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required username="connect_worker" password="password123" metadataServerUrls="https://ansiblebroker3.example.com:8090,https://ansiblebroker1.example.com:8090,https://ansiblebroker2.example.com:8090"; # noqa
-# producer.confluent.monitoring.interceptor.sasl.login.callback.handler.class=io.confluent.kafka.clients.plugins.auth.token.TokenUserLoginCallbackHandler # noqa 
-# producer.confluent.monitoring.interceptor.sasl.mechanism=OAUTHBEARER # noqa
-# producer.confluent.monitoring.interceptor.security.protocol=SASL_SSL # noqa
-
-            # REST Access to the Connector API
-            dist_props["rest.port"] = self.config.get("clientPort", 8083)
-            dist_props["rest.advertised.port"] = \
-                self.config.get("clientPort", 8083)
-            dist_props["listeners"] = "{}:{}".format(
-                self.config.get("listener"), self.config.get("clientPort")
+        # 5) MDS and C3 relations
+        # MDS Relation
+        if not self.mds.relation:
+            # MDS is only available for Confluent
+            logger.warning("MDS relation not detected")
+        elif self.mds.relation and self.distro != "confluent":
+            raise KafkaConnectCharmUnsupportedParamError(
+                "kafka distro {} does not support MDS "
+                "relation".format(self.distro)
             )
-            if len(self.config.get("rest-extension-classes", "")) > 0:
-                dist_props["rest.extension.classes"] = \
-                    self.config.get("rest-extension-classes")
-                dist_props["rest.servlet.initializor.classes"] = \
-                    self.config.get("rest-extension-classes")
-            if self.config.get("listener", "").startswith("https"):
-                dist_props["rest.advertised.listener"] = "https"
-                # TODO: change to SASL if needed
-                dist_props["security.protocol"] = "SSL"
-                if self.get_ssl_truststore():
-                    dist_props["ssl.truststore.location"] = \
-                        self.get_ssl_listener_truststore()
-                    dist_props["ssl.truststore.password"] = \
-                        self.ks.ts_listener_pwd
-#                    dist_props["listeners.https.ssl.truststore.location"] = \
-#                        dist_props["ssl.truststore.location"]
-#                    dist_props["listeners.https.ssl.truststore.password"] = \
-#                        dist_props["ssl.truststore.password"]
-            else:
-                dist_props["rest.advertised.listener"] = "http"
-            # TODO: certify we need to set the key below
-            # dist_props["public.key.path"] = /var/ssl/private/public.pem
+        # MDS relation present
+        mds_opts = self.mds.generate_configs(
+            self.config["mds_public_key_path"],
+            self.config.get("mds_user", ""),
+            self.config.get("mds_password", "")
+        )
+        if mds_opts:
+            dist_props = {**dist_props, **mds_opts}
+        # Set Confluent Center information
+        c3_config = self.c3.generate_configs(
+            self.get_ssl_listener_truststore(),
+            self.ks.ts_listener_pwd,
+            self._get_ldap_settings(self.mds.get_bootstrap_servers()),
+            dist_props.get("security.protocol", "PLAINTEXT"),
+            sasl_oauthbearer_enabled=self.is_sasl_ldap_enabled())
+        if c3_config:
+            # Remove the "client." prefix on some of the options
+            c3_config = {
+                k.replace("client.", ""): v for k, v in c3_config.items()
+            }
+            # Now, add c3_config twice
+            # one for the producer and another for consumer
+            # 1st, clean some options that are not needed:
+            del c3_config["producer.interceptor.classes"]
+            del c3_config["consumer.interceptor.classes"]
+            dist_props = {**dist_props, **{
+                "producer.{}".format(k): v for k, v in c3_config.items()
+            }}
+            dist_props = {**dist_props, **{
+                "consumer.{}".format(k): v for k, v in c3_config.items()
+            }}
+            # Final clean up on configs from C3:
+            dist_props["producer.interceptor.classes"] = \
+                "io.confluent.monitoring.clients.interceptor." + \
+                "MonitoringProducerInterceptor"
+            dist_props["consumer.interceptor.classes"] = \
+                "io.confluent.monitoring.clients.interceptor." + \
+                "MonitoringConsumerInterceptor"
+            dist_props["confluent.monitoring.interceptor.topic"] = \
+                "_confluent-monitoring"
+            del dist_props["consumer.sasl.jaas.config"]
+            del dist_props["producer.sasl.jaas.config"]
+            del dist_props["consumer.confluent.monitoring.interceptor.topic"]
+            del dist_props["producer.confluent.monitoring.interceptor.topic"]
 
-# TODO: Define those values later if SASL is enabled
-# rest.servlet.initializor.classes=io.confluent.common.security.jetty.initializer.InstallBearerOrBasicSecurityHandler # noqa
-# sasl.jaas.config=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required username="connect_worker" password="password123" metadataServerUrls="https://ansiblebroker3.example.com:8090,https://ansiblebroker1.example.com:8090,https://ansiblebroker2.example.com:8090"; # noqa
-# sasl.login.callback.handler.class=io.confluent.kafka.clients.plugins.auth.token.TokenUserLoginCallbackHandler # noqa
-# sasl.mechanism=OAUTHBEARER # noqa
-
+        # 6) Render the options
         logger.debug("Options are: {}".format(",".join(dist_props)))
         render(source="connect-distributed.properties.j2",
                target="/etc/kafka/connect-distributed.properties",
@@ -623,6 +667,7 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
                context={
                    "dist_props": dist_props
                })
+        return dist_props
 
     def _render_connect_log4j_properties(self):
         root_logger = self.config.get("log4j-root-logger", None) or \
@@ -637,6 +682,7 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
                context={
                    "root_logger": root_logger
                })
+        return root_logger
 
     def _render_systemd_service(self):
         render(source="service.conf.j2",
@@ -650,20 +696,49 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
                })
 
     def _on_config_changed(self, event):
+        """Runs the changes on configuraiton files.
+
+        1) Check for any missing relations
+        2) Check if TLS is set and configured correctly
+        3) Prepare context: generate the configuration files
+        4) Restart cycle"""
+
+        # 1) Check for any missing relations
+        if not self.listener.relations:
+            self.model.unit.status = BlockedStatus(
+                "Waiting for listener relation")
+            # Abandon event as new relation will trigger config-changed
+            return
+        if not self.sr.relations:
+            self.model.unit.status = BlockedStatus(
+                "Waiting for schema registry relation")
+            # Abandon event as new relations will trigger config-changed
+            return
+        if self.distro != "confluent" and \
+           self.c3.relations or self.mds.relations:
+            self.model.unit.status = BlockedStatus(
+                "Confluent-only relation set but distro is not confluent")
+            # Abandon event as new relations will trigger config-changed
+            return
+
+        # 2) Check if TLS is set and configured correctly
         if not self._cert_relation_set(event):
             return
         self.model.unit.status = \
             MaintenanceStatus("generate certs and keys if needed")
         logger.debug("Running _generate_keystores()")
         self._generate_keystores()
+
+        # 3) Prepare context
         self.model.unit.status = \
             MaintenanceStatus("Generate Listener settings")
         self._generate_listener_request()
         self.model.unit.status = \
             MaintenanceStatus("Render connect-distributed.properties")
         logger.debug("Running render_connect_distributed_properties()")
+        ctx = super()._on_config_changed(event)
         try:
-            self._render_connect_distribute_properties(event)
+            ctx["c_opts"] = self._render_connect_distribute_properties()
         except KafkaConnectCharmNotValidOptionSetError as e:
             # Returning as we need to wait for a config change and that
             # will trigger a new event
@@ -681,14 +756,16 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             return
         self.model.unit.status = MaintenanceStatus("Render log4j properties")
         logger.debug("Running log4j properties renderer")
-        self._render_connect_log4j_properties()
+        ctx["log4j_opts"] = self._render_connect_log4j_properties()
         self.model.unit.status = \
             MaintenanceStatus("Render service override conf file")
         logger.debug("Render override.conf")
-        self.render_service_override_file(
+        ctx["service"] = self.render_service_override_file(
             target="/etc/systemd/system/"
                    "{}.service.d/override.conf".format(self.service))
         self._render_systemd_service()
+
+        # 4) Restart cycle
         if self._check_if_ready_to_start():
             logger.info("Service ready or start, restarting it...")
             # Unmask and enable service

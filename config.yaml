@@ -29,6 +29,67 @@ options:
     type: string
     description: |
       Sets the kafka version for the given distro.
+  api_url:
+    default: ''
+    type: string
+    description: |
+      URL: overrides the value used by default to set the API endpoint.
+      If unset, the hostname of the advertised address for the connect interface will be used.
+  kafka-connect-cluster-name:
+    default: "juju-kafka-connect"
+    type: string
+    description: |
+      Kafka connect cluster name to be used to identify this cluster on MDS service.
+      Confluent only
+  sasl-protocol:
+    default: ''
+    type: string
+    description: |
+      Define which of the SASL protocols should be used for authentication. In the case of Zookeeper,
+      only kerberos and digest methods are available.
+  mds_public_key_path:
+    default: "/var/ssl/private/public.pem"
+    type: string
+    description: |
+      Path to be used to store the public key that will encrypt the oauthbearer token
+  mds_user:
+    default: ''
+    type: string
+    description: |
+      Set MDS user for the OAUTHBEARER. Only available on Confluent distro.
+      In case Brokers are configured for LDAP, then mds_user should be the LDAP user for kafka_rest.
+  mds_password:
+    default: ''
+    type: string
+    description: |
+      Set mds password for the OAUTHBEARER. Only available on Confluent distro.
+      In case Brokers are configured for LDAP, then mds_user should be the LDAP user for kafka_rest.
+  kerberos-admin-hostname:
+    default: ''
+    type: string
+    description: |
+      Set the kerberos admin hostname to authenticate with.
+  kerberos-kdc-hostname:
+    default: ''
+    type: string
+    description: |
+      Set the kerberos kdc hostname to authenticate with.
+  kerberos-protocol:
+    default: ''
+    type: string
+    description: |
+      Set the kerberos protocol. This will form the principal such as: {{protocol}}/<hostname>@<realm>
+  kerberos-realm:
+    default: ''
+    type: string
+    description: |
+      Set the kerberos realm value.
+  kerberos-domain:
+    default: ''
+    type: string
+    description: |
+      Defines the kerberos domain for the host: {{protocol}}/<name of the host>.<kerberos-domain>@<realm>
+      The value set here should be the domain for the default gateway's IP.
   keystore-path:
     default: '/var/ssl/private/zookeeper.keystore.jks'
     type: string
@@ -69,14 +130,8 @@ options:
     default: "connect-cluster"
     type: string
     description: |
-      Group.id to be used in the Connect configuration
-  rest-extension-classes:
-    default: ""
-    type: string
-    description: |
-      Comma-separated list of extension classes to be used by Connector REST API.
-      If secrets is set, also use: io.confluent.connect.secretregistry.ConnectSecretRegistryExtension
-      If RBAC is set for confluent, set: io.confluent.connect.security.ConnectSecurityExtension
+      Group.id to be used in the Connect configuration.
+      Customize if configuring several Kafka Connect clusers
   client-auth:
     default: False
     type: boolean
@@ -190,7 +245,7 @@ options:
     description: |
       Key to be used in base64
   user:
-    default: 'cp-schema-registry'
+    default: 'cp-kafka-connect'
     type: string
     description: |
       User set for kafka broker services
@@ -204,6 +259,7 @@ options:
     default: 8083
     description: |
       Port to be used to listen for client connections.
+      Used for the REST API access to the Kafka Connect cluster.
   log4j-root-logger:
     type: string
     default: "INFO, stdout, connectAppender"
@@ -243,8 +299,10 @@ options:
   connect-distributed-properties:
     type: string
     description: |
-      Settings to be added to zookeeper.properties file.
+      Settings to be added to connect-distributed.properties file.
       YAML formatted list of items
+      If secrets is set, also use: rest.extension.classes: io.confluent.connect.secretregistry.ConnectSecretRegistryExtension
+      If LDAP is set for confluent, set: rest.servlet.initializor.classes: io.confluent.connect.security.ConnectSecurityExtension
     default: |
       status.storage.replication.factor: 3
       status.storage.topic: connect-cluster-status
@@ -253,6 +311,8 @@ options:
       offset.storage.topic: connect-cluster-offsets
       config.storage.replication.factor: 3
       config.storage.topic: connect-cluster-configs
+      rest.servlet.initializor.classes: io.confluent.common.security.jetty.initializer.InstallBearerOrBasicSecurityHandler
+      rest.extension.classes: io.confluent.connect.security.ConnectSecurityExtension,io.confluent.connect.secretregistry.ConnectSecretRegistryExtension
   jmx-exporter-port:
     type: int
     default: 8079
