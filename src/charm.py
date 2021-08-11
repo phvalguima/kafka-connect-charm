@@ -21,12 +21,19 @@ from charmhelpers.core.host import (
     service_reload
 )
 
+from charmhelpers.core.hookenv import (
+    open_port
+)
+
 from wand.apps.relations.tls_certificates import (
-    TLSCertificateRequiresRelation
+    TLSCertificateRequiresRelation,
+    TLSCertificateDataNotFoundInRelationError
 )
 from wand.apps.kafka import (
     KafkaJavaCharmBase,
-    KafkaCharmBaseFeatureNotImplementedError
+    KafkaCharmBaseFeatureNotImplementedError,
+    KafkaJavaCharmBasePrometheusMonitorNode,
+    KafkaJavaCharmBaseNRPEMonitoring
 )
 from wand.apps.relations.kafka_mds import (
     KafkaMDSRequiresRelation
@@ -51,6 +58,9 @@ from wand.security.ssl import genRandomPassword, CreateTruststore
 from wand.contrib.linux import (
     get_hostname
 )
+
+from loadbalancer_interface import LBProvider
+
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +108,10 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
         self.framework.observe(self.on.install, self._on_install)
         self.framework.observe(self.on.config_changed,
                                self._on_config_changed)
+        self.framework.observe(self.on.cluster_relation_joined,
+                               self.on_cluster_relation_joined)
+        self.framework.observe(self.on.cluster_relation_changed,
+                               self.on_cluster_relation_changed)
         self.framework.observe(self.on.listeners_relation_joined,
                                self.on_listeners_relation_joined)
         self.framework.observe(self.on.listeners_relation_changed,
@@ -151,6 +165,66 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
         self.ks.set_default(ts_schemaregistry_pwd=genRandomPassword())
         self.ks.set_default(has_exception="")
         self.ks.set_default(listener_plaintext_pwd=genRandomPassword(24))
+        self.ks.set_default(ports=[])
+        self.ks.set_default(ssl_certs=[])
+        self.ks.set_default(lb_port=0)
+        # Load balancer settings
+        self.lb_provider = LBProvider(self, "lb-provider")
+        self.framework.observe(self.lb_provider.on.available,
+                               self._on_lb_provider_available)
+        # LMA integrations
+        self.prometheus = \
+            KafkaJavaCharmBasePrometheusMonitorNode(
+                self, 'prometheus-manual',
+                port=self.config.get("jmx-exporter-port", 9404),
+                internal_endpoint=self.config.get(
+                    "jmx_exporter_use_internal", False),
+                labels=self.config.get("jmx_exporter_labels", None))
+        self.nrpe = KafkaJavaCharmBaseNRPEMonitoring(
+            self,
+            svcs=[self._get_service_name()],
+            endpoints=[],
+            nrpe_relation_name='nrpe-external-master')
+
+    def _on_lb_provider_available(self, event):
+        if not (self.unit.is_leader() and self.lb_provider.is_available):
+            return
+        # Check if there is any configuration changes:
+        if self.ks.lb_port == self.config["clientPort"] and \
+           self.ks.lb_api_ip == self.config["api_ip"] and \
+           self.ks.api_is_public == self.config["api_is_public"]:
+            # configs are the same, just return
+            return
+        request = self.lb_provider.get_request("lb-consumer")
+        request.protocol = request.protocols.tcp
+        request.port_mapping = {
+            self.config["clientPort"]: self.config["clientPort"]
+        }
+        if len(self.config.get("api_ip", "")) > 0:
+            request.ingress_address = self.config["api_ip"]
+        request.public = self.config["api_is_public"]
+        self.lb_provider.send_request(request)
+        # Now, save the data for the next request
+        self.ks.lb_port = self.config["clientPort"]
+        self.ks.lb_api_ip = self.config["api_ip"]
+        self.ks.api_is_public = self.config["api_is_public"]
+
+    def is_jmxexporter_enabled(self):
+        if self.prometheus.relations:
+            return True
+        return False
+
+    def on_cluster_relation_joined(self, event):
+        self._on_config_changed(event)
+
+    def on_cluster_relation_changed(self, event):
+        self._on_config_changed(event)
+        if not self.prometheus.relations:
+            return
+        # Update prometheus relation given it may mean a new unit
+        # is available.
+        if len(self.prometheus.relations) > 0:
+            self.prometheus.on_prometheus_relation_changed(event)
 
     def _get_url(self):
         """ Returns the URL to be used to access Connect services"""
@@ -185,29 +259,17 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
         self.connect.on_connect_relation_changed(event)
 
     def on_schemaregistry_relation_joined(self, event):
-        if not self._cert_relation_set(
-                event, self.sr):
-            return
         self.sr.on_schema_registry_relation_joined(event)
         self._on_config_changed(event)
 
     def on_schemaregistry_relation_changed(self, event):
-        if not self._cert_relation_set(
-                event, self.sr):
-            return
         self.sr.on_schema_registry_relation_changed(event)
         self._on_config_changed(event)
 
     def on_c3_relation_joined(self, event):
-        if not self._cert_relation_set(
-                event, self.connect):
-            return
         self._on_config_changed(event)
 
     def on_c3_relation_changed(self, event):
-        if not self._cert_relation_set(
-                event, self.connect):
-            return
         self._on_config_changed(event)
 
     def _generate_listener_request(self):
@@ -250,16 +312,40 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
         return req
 
     def on_listeners_relation_joined(self, event):
-        # If no certificate available, defer this event and wait
-        if not self._cert_relation_set(event, self.listener):
-            return
         self._on_config_changed(event)
 
     def on_listeners_relation_changed(self, event):
-        self.on_listeners_relation_joined(event)
+        try:
+            self.listener.on_listener_relation_changed(event)
+        except KafkaRelationBaseTLSNotSetError:
+            logger.warning(
+                "Detected some of the remote apps on listener relation "
+                "but still waiting for setup on this unit.")
+            # We need certs correctly configured to be able to set listeners
+            # because certs are configured on other peers.
+            # Defer this event until operator updates certificate info.
+            self.model.unit.status = BlockedStatus(
+                "Missing certificate info: listeners")
+            event.defer()
+            return
+        self._on_config_changed(event)
 
     def on_certificates_relation_joined(self, event):
         self.certificates.on_tls_certificate_relation_joined(event)
+        # Relation just joined, request certs for each of the relations
+        # That will happen once. The certificates will be generated, then
+        # it will trigger a -changed Event on certificates, which will
+        # call the config-changed logic once again.
+        # That way, the certificates will be added to the truststores
+        # and shared across the other relations.
+
+        # In case several relations shares the same set of IPs (spaces),
+        # the last relation will get to set the certificate values.
+        # Therefore, the order of the list below is relevant.
+        for r in [self.listener,
+                  self.sr,
+                  self.connect]:
+            self._cert_relation_set(None, r)
         self._on_config_changed(event)
 
     def on_certificates_relation_changed(self, event):
@@ -388,7 +474,8 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
     def is_ssl_enabled(self):
         """Returns true if the API endpoint has the SSL enabled"""
         return len(self.get_ssl_cert()) > 0 and \
-            len(self.get_ssl_key()) > 0
+            len(self.get_ssl_key()) > 0 and \
+            len(self.get_ssl_keystore())
 
     def _render_connect_distribute_properties(self):
         """
@@ -420,43 +507,28 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
         extra_certs = []
 
         # REST Access to the Connector API
+        # Set the connect relation:
+        self.connect.url = self._get_api_url(self.connect.advertise_addr)
+        dist_props["rest.advertised.host.name"] = \
+            self.connect.url
+
         dist_props["rest.port"] = self.config.get("clientPort", 8083)
         dist_props["rest.advertised.port"] = \
             self.config.get("clientPort", 8083)
         dist_props["listeners"] = "{}:{}".format(
             self.config.get("listener"), self.config.get("clientPort")
         )
-        dist_props["rest.advertised.host.name"] = "{}".format(
-            self.config["api_url"] if len(self.config["api_url"]) > 0
-            else get_hostname(self.connect.advertise_addr))
         if self.is_ssl_enabled():
             dist_props["rest.advertised.listener"] = "https"
-        else:
-            dist_props["rest.advertised.listener"] = "http"
-        if len(self.get_ssl_keystore()) > 0:
             dist_props["listeners.https.ssl.key.password"] = \
                 self.ks.ks_password
             dist_props["listeners.https.ssl.keystore.password"] = \
                 self.ks.ks_password
             dist_props["listeners.https.ssl.keystore.location"] = \
                 self.get_ssl_keystore()
-        if len(self.get_ssl_truststore()) > 0:
-            dist_props["listeners.https.ssl.truststore.password"] = \
-                self.ks.ts_password
-            dist_props["listeners.https.ssl.truststore.location"] = \
-                self.get_ssl_truststore()
 
-        # Set the connect relation:
-        if self.connect.relations:
-            self.connect.url = self._get_api_url(self.connect.advertise_addr)
-
-        # External connection
-        if len(self.get_ssl_cert()) > 0 and len(self.get_ssl_key()) > 0 and \
-           len(self.get_ssl_truststore()):
-            # As server side, we need the keystore at least
-            if len(self.get_ssl_keystore()) == 0:
-                raise KafkaConnectCharmNotValidOptionSetError("keystore-path")
             if self.connect.relations:
+                # If there is a relation, then set TLS certificate
                 self.connect.set_TLS_auth(
                     self.get_ssl_cert(),
                     self.get_ssl_truststore(),
@@ -464,25 +536,44 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
                     user=self.config["user"],
                     group=self.config["group"],
                     mode=0o640)
-            else:
-                # We should consider the situation where connect
-                # is only exposed
-                # to the outside and no relations are set
+
+            if len(self.get_ssl_truststore()) > 0:
+                dist_props["listeners.https.ssl.truststore.password"] = \
+                    self.ks.ts_password
+                dist_props["listeners.https.ssl.truststore.location"] = \
+                    self.get_ssl_truststore()
+                # With or without a Connect relation, set the truststore
+                # First, create a list out of current certs exchanged via
+                # cluster relation or passed via actions
+                crt_list = list(self.ks.ssl_certs) + extra_certs
+                if len(crt_list) == 0:
+                    crt_list = [self.get_ssl_cert()]
+                # Now, get all the certs added via connect relation:
+                if self.connect.relations:
+                    for r in self.connect.relations:
+                        for u in r.units:
+                            if "tls_cert" in r.data[u]:
+                                crt_list.append(r.data[u]["tls_cert"])
                 ts_regenerate = \
                     self.config["regenerate-keystore-truststore"]
+                # Finally, create the Truststore
                 CreateTruststore(
                     self.get_ssl_truststore(),
                     self.ks.ts_password,
-                    extra_certs,
+                    crt_list,
                     ts_regenerate=ts_regenerate,
                     user=self.config["user"],
                     group=self.config["group"],
                     mode=0o640)
+        else:
+            dist_props["rest.advertised.listener"] = "http"
 
         # 3) Broker listeners setup
-        if not self.listener.relation:
+        if not self.listener.relations:
             raise KafkaConnectCharmMissingRelationError("listeners")
-        if self.get_ssl_listener_truststore():
+        if len(self.get_ssl_listener_keystore()) > 0 and \
+           len(self.get_ssl_listener_key()) > 0:
+            # Will use key and keystore for listeners client auth
             self.listener.set_TLS_auth(
                 self.get_ssl_listener_cert(),
                 self.get_ssl_listener_truststore(),
@@ -490,11 +581,33 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
                 user=self.config["user"],
                 group=self.config["group"],
                 mode=0o640)
+        if len(self.get_ssl_listener_truststore()) > 0 and \
+           len(self.get_ssl_listener_cert()) > 0:
+            # Not running a SR cluster, then manually add
+            # unit's own cert
+            crt_list = [self.get_ssl_listener_cert()]
+            if self.listener.relations:
+                for r in self.listener.relations:
+                    for u in r.units:
+                        if "tls_cert" in r.data[u]:
+                            crt_list.append(r.data[u]["tls_cert"])
+            if len(crt_list) > 0:
+                # We do have a certificate list to trust
+                # Came from both cluster peers and SR relation
+                CreateTruststore(
+                    self.get_ssl_truststore(),
+                    self.ks.ts_listener_pwd,
+                    crt_list,
+                    ts_regenerate=True,
+                    user=self.config["user"],
+                    group=self.config["group"],
+                    mode=0o640)
+        # Generate options
         listener_opts = self.listener.generate_options(
             self.get_ssl_listener_keystore(),
-            self.ks.ks_password,
+            self.ks.ks_listener_pwd,
             self.get_ssl_listener_truststore(),
-            self.ks.ts_password,
+            self.ks.ts_listener_pwd,
             prefix="")
         if listener_opts:
             dist_props = {**dist_props, **listener_opts}
@@ -542,6 +655,37 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             dist_props = {**dist_props, **{
                 "value.converter.{}".format(k): v for k, v in sr_config.items()
             }}
+        if len(self.get_ssl_schemaregistry_keystore()) > 0 and \
+           len(self.get_ssl_schemaregistry_key()) > 0:
+            # Will use key and keystore for listeners client auth
+            self.sr.set_TLS_auth(
+                self.get_ssl_schemaregistry_cert(),
+                self.get_ssl_schemaregistry_truststore(),
+                self.ks.ts_schemaregistry_pwd,
+                user=self.config["user"],
+                group=self.config["group"],
+                mode=0o640)
+        if len(self.get_ssl_schemaregistry_truststore()) > 0 and \
+           len(self.get_ssl_schemaregistry_cert()) > 0:
+            # Not running a SR cluster, then manually add
+            # unit's own cert
+            crt_list = [self.get_ssl_schemaregistry_cert()]
+            if self.sr.relations:
+                for r in self.sr.relations:
+                    for u in r.units:
+                        if "tls_cert" in r.data[u]:
+                            crt_list.append(r.data[u]["tls_cert"])
+            if len(crt_list) > 0:
+                # We do have a certificate list to trust
+                # Came from both cluster peers and SR relation
+                CreateTruststore(
+                    self.get_ssl_schemaregistry_truststore(),
+                    self.ks.ts_schemaregistry_pwd,
+                    crt_list,
+                    ts_regenerate=True,
+                    user=self.config["user"],
+                    group=self.config["group"],
+                    mode=0o640)
 
         # 5) MDS and C3 relations
         # MDS Relation
@@ -559,6 +703,12 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             self.config.get("mds_user", ""),
             self.config.get("mds_password", "")
         )
+        if (self.mds.relations or self.c3.relations) and \
+           self.distro != "confluent":
+            self.model.unit.status = \
+                BlockedStatus("Not using confluent but MDS or"
+                              " confluent center relations used")
+            return
         if mds_opts:
             dist_props = {**dist_props, **mds_opts}
         # Set Confluent Center information
@@ -593,10 +743,15 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
                 "MonitoringConsumerInterceptor"
             dist_props["confluent.monitoring.interceptor.topic"] = \
                 "_confluent-monitoring"
-            del dist_props["consumer.sasl.jaas.config"]
-            del dist_props["producer.sasl.jaas.config"]
-            del dist_props["consumer.confluent.monitoring.interceptor.topic"]
-            del dist_props["producer.confluent.monitoring.interceptor.topic"]
+            if "consumer.sasl.jaas.config" in dist_props:
+                del dist_props["consumer.sasl.jaas.config"]
+            if "producer.sasl.jaas.config" in dist_props:
+                del dist_props["producer.sasl.jaas.config"]
+            inter = "confluent.monitoring.interceptor.topic"
+            if "consumer." + inter in dist_props:
+                del dist_props["consumer." + inter]
+            if "producer." + inter in dist_props:
+                del dist_props["producer." + inter]
 
         # 6) Render the options
         logger.debug("Options are: {}".format(",".join(dist_props)))
@@ -637,12 +792,28 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
                })
 
     def _on_config_changed(self, event):
-        """Runs the changes on configuraiton files.
+        """Runs the changes on configuration files.
+
+        Status management:
+        Config changed sets unit status to Maintenance. Once it is configured
+        and all settings are correctly issued, open ports, restart and move it
+        to ActiveStatus.
+
+        Any rendering method can move it to BlockedStatus. In this case, a
+        check must be run after each render_* function and if model is now
+        blocked, stop the configuration.
+
+        No need to defer the event given each -hook call also calls this
+        config_changed.
+
+        Following steps will be taken:
 
         1) Check for any missing relations
         2) Check if TLS is set and configured correctly
         3) Prepare context: generate the configuration files
-        4) Restart cycle"""
+        4) Open ports
+        5) Restart cycle
+        6) Rerun load balancer"""
 
         # 1) Check for any missing relations
         if not self.listener.relations:
@@ -656,29 +827,66 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             # Abandon event as new relations will trigger config-changed
             return
         if self.distro != "confluent" and \
-           self.c3.relations or self.mds.relations:
+           (self.c3.relations or self.mds.relations):
             self.model.unit.status = BlockedStatus(
                 "Confluent-only relation set but distro is not confluent")
             # Abandon event as new relations will trigger config-changed
             return
 
         # 2) Check if TLS is set and configured correctly
-        if not self._cert_relation_set(event):
-            return
+        # Prepare context: generate the configuration files
+        ctx = {}
         self.model.unit.status = \
             MaintenanceStatus("generate certs and keys if needed")
-        logger.debug("Running _generate_keystores()")
-        self._generate_keystores()
+        try:
+            self._generate_keystores()
+        except TLSCertificateDataNotFoundInRelationError:
+            logger.warn("Generate keystore could not find certificate "
+                        "relation data. Missing 'common_name'")
+            logger.debug("Certificate relation data is: {}".format(
+                self.certificates.relation.data[self.unit]
+            ))
+            self.model.unit.status = \
+                BlockedStatus("Missing data in certificates relation")
+        if not isinstance(self.model.unit.status, MaintenanceStatus):
+            logger.info("_generate_keystores() blocked the status, return")
+            return
+
+        # 2.1) Share certs with cluster peers
+        if len(self.framework.model.relations["cluster"]) > 0:
+            cluster_rel = self.framework.model.relations["cluster"][0]
+            if cluster_rel:
+                # Update certificate information:
+                if len(self.get_ssl_cert()) > 0:
+                    cluster_rel.data[self.unit]["cert"] = self.get_ssl_cert()
+                    self.ks.ssl_certs = []
+                    # And read each certificate data, store on a StoredState
+                    for u in cluster_rel.units:
+                        if "cert" in cluster_rel.data[u]:
+                            self.ks.ssl_certs.append(
+                                cluster_rel.data[u]["cert"])
 
         # 3) Prepare context
         self.model.unit.status = \
             MaintenanceStatus("Generate Listener settings")
         self._generate_listener_request()
+        if not isinstance(self.model.unit.status, MaintenanceStatus):
+            logger.info("Generate listener request blockd the status, return")
+            return
+
+        # Config change will generate JAAS and render svc override confs
+        self.model.unit.status = \
+            MaintenanceStatus("Render JAAS configs")
+        ctx = super()._on_config_changed(event)
+        if not isinstance(self.model.unit.status, MaintenanceStatus):
+            logger.info("JAAS conf blocked status, return")
+            return
+
+        # Running main config render
         self.model.unit.status = \
             MaintenanceStatus("Render connect-distributed.properties")
-        logger.debug("Running render_connect_distributed_properties()")
-        ctx = super()._on_config_changed(event)
         try:
+            logger.debug("Running render_connect_distributed_properties()")
             ctx["c_opts"] = self._render_connect_distribute_properties()
         except KafkaConnectCharmNotValidOptionSetError as e:
             # Returning as we need to wait for a config change and that
@@ -695,9 +903,18 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             logger.warn("Listener relation not ready yet: {}".format(str(e)))
             event.defer()
             return
+        if not isinstance(self.model.unit.status, MaintenanceStatus):
+            logger.info("Render connect distributed blocked status, return")
+            return
+
+        # Render log4j config
         self.model.unit.status = MaintenanceStatus("Render log4j properties")
         logger.debug("Running log4j properties renderer")
         ctx["log4j_opts"] = self._render_connect_log4j_properties()
+        if not isinstance(self.model.unit.status, MaintenanceStatus):
+            logger.info("render log4j blocked status, return")
+            return
+
         self.model.unit.status = \
             MaintenanceStatus("Render service override conf file")
         logger.debug("Render override.conf")
@@ -705,8 +922,22 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             target="/etc/systemd/system/"
                    "{}.service.d/override.conf".format(self.service))
         self._render_systemd_service()
+        if not isinstance(self.model.unit.status, MaintenanceStatus):
+            logger.info("render svc override blocked status, return")
+            return
 
-        # 4) Restart cycle
+        # Restart has_exception for the next event
+        self.ks.has_exception = ""
+        # 4) Open ports
+        # 4.1) Close original ports
+        # for p in self.ks.ports:
+        #     if p > 0:
+        #         close_port(p)
+        # 4.2) Open ports for the newly found listeners
+        open_port(self.config.get("clientPort", 8083))
+        self.ks.ports = [self.config.get("clientPort", 8083)]
+
+        # 5) Restart cycle
         if self._check_if_ready_to_start():
             logger.info("Service ready or start, restarting it...")
             # Unmask and enable service
@@ -719,8 +950,9 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             logger.warning("Service not running that "
                            "should be: {}".format(self.service))
             BlockedStatus("Service not running {}".format(self.service))
-        # Restart has_exception for the next event
-        self.ks.has_exception = ""
+
+        # 6) Rerun load balancer config
+        self._on_lb_provider_available(event)
 
 
 if __name__ == "__main__":

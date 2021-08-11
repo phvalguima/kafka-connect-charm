@@ -8,6 +8,9 @@ summary: |
 series:
 - bionic
 subordinate: false
+peers:
+  cluster:
+    interface: schema-registry-peer
 requires:
   c3:
     interface: confluent-control-center
@@ -19,9 +22,16 @@ requires:
     interface: tls-certificates
   schemaregistry:
     interface: schemaregistry
+  lb-provider:
+    interface: loadbalancer
+    limit: 1
 provides:
   connect:
     interface: kafka-connect
+  prometheus-manual:
+    interface: prometheus-manual
+  nrpe-external-master:
+    interface: nrpe-external-master
 resources:
   archive:
     type: file
