@@ -466,9 +466,9 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
 
     def _get_service_name(self):
         if self.distro == 'confluent':
-            self.service = 'confluent-kafka-connect.service'
+            self.service = 'confluent-kafka-connect'
         elif self.distro == "apache":
-            self.service = "kafka-connect.service"
+            self.service = "kafka-connect"
         return self.service
 
     def is_ssl_enabled(self):
@@ -508,7 +508,11 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
 
         # REST Access to the Connector API
         # Set the connect relation:
-        self.connect.url = self._get_api_url(self.connect.advertise_addr)
+        if self.unit.is_leader():
+            if len(self.config["api_url"]) > 0:
+                self.connect.url = self.config["api_url"]
+            else:
+                self.connect.url = get_hostname(self.connect.advertise_addr)
         dist_props["rest.advertised.host.name"] = \
             self.connect.url
 
@@ -595,7 +599,7 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
                 # We do have a certificate list to trust
                 # Came from both cluster peers and SR relation
                 CreateTruststore(
-                    self.get_ssl_truststore(),
+                    self.get_ssl_listener_truststore(),
                     self.ks.ts_listener_pwd,
                     crt_list,
                     ts_regenerate=True,

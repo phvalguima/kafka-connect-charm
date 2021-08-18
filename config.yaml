@@ -287,9 +287,9 @@ options:
       YAML formatted list of extra arguments to be added to [Environment] field of the service.
       If Schema Registry secrets protection is enabled, set: CONFLUENT_SECURITY_MASTER_KEY to the masterkey.
     default: |
-       SCHEMA_REGISTRY_HEAP_OPTS: "-Xms1g -Xmx1g -XX:MetaspaceSize=96m -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35 -XX:G1HeapRegionSize=16M -XX:MinMetaspaceFreeRatio=50 -XX:MaxMetaspaceFreeRatio=80"
-       KAFKA_LOG4J_OPTS: "-Dlog4j.configuration=file:/etc/kafka/zookeeper-log4j.properties"
-       LOG_DIR: "/var/log/schema-registry"
+       KAFKA_HEAP_OPTS: "-Xms256M -Xmx2G"
+       KAFKA_LOG4J_OPTS: "-Dlog4j.configuration=file:/etc/kafka/log4j.properties"
+       LOG_DIR: "/var/log/kafka"
   service-unit-overrides:
     type: string
     default: ''
@@ -311,7 +311,7 @@ options:
     description: |
       Settings to be added to connect-distributed.properties file.
       YAML formatted list of items
-      If secrets is set, also use: rest.extension.classes: io.confluent.connect.secretregistry.ConnectSecretRegistryExtension
+      If Confluent and secrets is set, also use: rest.extension.classes: io.confluent.connect.secretregistry.ConnectSecretRegistryExtension
       If LDAP is set for confluent, set: rest.servlet.initializor.classes: io.confluent.connect.security.ConnectSecurityExtension
     default: |
       status.storage.replication.factor: 3
@@ -321,8 +321,6 @@ options:
       offset.storage.topic: connect-cluster-offsets
       config.storage.replication.factor: 3
       config.storage.topic: connect-cluster-configs
-      rest.servlet.initializor.classes: io.confluent.common.security.jetty.initializer.InstallBearerOrBasicSecurityHandler
-      rest.extension.classes: io.confluent.connect.security.ConnectSecurityExtension,io.confluent.connect.secretregistry.ConnectSecretRegistryExtension
   jmx_exporter_version: 
     default: "0.12.0"
     type: string

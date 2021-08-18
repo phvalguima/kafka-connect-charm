@@ -244,7 +244,17 @@ class TestCharm(unittest.TestCase):
             "ssl_sr_cert": "SSL_CERT",
             "ssl_sr_key": "SSL_KEY",
             "ssl_listener_cert": "SSL_CERT",
-            "ssl_listener_key": "SSL_KEY"
+            "ssl_listener_key": "SSL_KEY",
+            "connect-distributed-properties": """  rest.extension.classes: "io.confluent.connect.security.ConnectSecurityExtension,io.confluent.connect.secretregistry.ConnectSecretRegistryExtension"
+  rest.servlet.initializor.classes: io.confluent.common.security.jetty.initializer.InstallBearerOrBasicSecurityHandler
+  status.storage.replication.factor: 3
+  status.storage.topic: connect-cluster-status
+  offset.flush.interval.ms: 10000
+  offset.storage.replication.factor: 3
+  offset.storage.topic: connect-cluster-offsets
+  config.storage.replication.factor: 3
+  config.storage.topic: connect-cluster-configs
+""" # noqa
         })
         # MDS RELATION SETUP
         mds_id = self.harness.add_relation("mds", "broker")
