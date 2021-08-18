@@ -27,7 +27,8 @@ from charmhelpers.core.hookenv import (
 
 from wand.apps.relations.tls_certificates import (
     TLSCertificateRequiresRelation,
-    TLSCertificateDataNotFoundInRelationError
+    TLSCertificateDataNotFoundInRelationError,
+    TLSCertificateRelationNotPresentError
 )
 from wand.apps.kafka import (
     KafkaJavaCharmBase,
@@ -182,7 +183,7 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
                 labels=self.config.get("jmx_exporter_labels", None))
         self.nrpe = KafkaJavaCharmBaseNRPEMonitoring(
             self,
-            svcs=[self._get_service_name()],
+            svcs=[],
             endpoints=[],
             nrpe_relation_name='nrpe-external-master')
 
@@ -438,13 +439,18 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
             raise KafkaRelationBaseTLSNotSetError(
                 "_get_ssl relatio {} or certificates"
                 " not available".format(relation))
-        certs = self.certificates.get_server_certs()
-        c = certs[relation.binding_addr][ty]
-        if ty == "cert":
-            c = c + \
-                self.certificates.get_chain()
-        logger.debug("SSL {} for {}"
-                     " from tls-certificates: {}".format(ty, prefix, c))
+        try:
+            certs = self.certificates.get_server_certs()
+            c = certs[relation.binding_addr][ty]
+            if ty == "cert":
+                c = c + \
+                    self.certificates.get_chain()
+            logger.debug("SSL {} for {}"
+                         " from tls-certificates: {}".format(ty, prefix, c))
+        except (TLSCertificateDataNotFoundInRelationError,
+                TLSCertificateRelationNotPresentError):
+            # Certificates not ready yet, return empty
+            return ""
         return c
 
     def _generate_keystores(self):
@@ -940,6 +946,11 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
         # 4.2) Open ports for the newly found listeners
         open_port(self.config.get("clientPort", 8083))
         self.ks.ports = [self.config.get("clientPort", 8083)]
+        endpoints = ["127.0.0.1:{}".format(self.config.get("clientPort", 8083))]
+        self.nrpe.recommit_checks(
+            svcs=[],
+            endpoints=endpoints
+        )
 
         # 5) Restart cycle
         if self._check_if_ready_to_start():
