@@ -901,12 +901,12 @@ class KafkaConnectCharm(KafkaJavaCharmBase):
         except KafkaConnectCharmNotValidOptionSetError as e:
             # Returning as we need to wait for a config change and that
             # will trigger a new event
-            self.model.unit.status = str(e)
+            self.model.unit.status = BlockedStatus(str(e))
             self.ks.has_exception = str(e)
             return
         except KafkaConnectCharmMissingRelationError as e:
             # same reason as above, waiting for an add-relation
-            self.model.unit.status = str(e)
+            self.model.unit.status = BlockedStatus(str(e))
             self.ks.has_exception = str(e)
             return
         except KafkaListenerRelationNotSetError as e:
